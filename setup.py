@@ -29,7 +29,7 @@ setuptools.setup(
     install_requires=[
         'streql==3.0.2',
         'dnspython',
-        'phonenumbers==7.4.1',
+        'phonenumbers==8.12.45',
         'twilio==6.25.0',
         'google-api-python-client==1.4.2',
         'oauth2client==1.4.12',
@@ -40,9 +40,9 @@ setuptools.setup(
         'falcon==1.4.1',
         'falcon-cors',
         'ujson==1.35',
-        'requests',
-        'PyMySQL==0.9.3',
-        'SQLAlchemy==1.3.0',
+        'requests==2.27',
+        'pymysql==0.9.3',
+        'sqlalchemy==1.3.0',
         'Jinja2',
         'Markdown',
         'click',
@@ -57,6 +57,7 @@ setuptools.setup(
         'pyfcm==1.4.3',
         'oncallclient==1.1.0',
         'idna==3.0',
+        'irisapi'
         'pyqrcode==1.2.1',
         'plivo==4.18.1'
     ],
