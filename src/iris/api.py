@@ -40,7 +40,9 @@ from . import client
 from .role_lookup import get_role_lookups
 from .config import load_config
 from iris.vendors.iris_slack import iris_slack
+
 from iris.role_lookup import IrisRoleLookupException
+
 from iris.sender import auditlog
 from iris.bin.sender import set_target_contact, render
 from iris.utils import sanitize_unicode_dict
@@ -776,9 +778,7 @@ class ReqBodyMiddleware(object):
 
 
 class AuthMiddleware(object):
-    def __init__(self, config={}, debug=False):
-
-        self.allowlisted_apps = config.get('allowlisted_internal_apps', [])
+    def __init__(self, debug=False):
         if debug:
             self.process_resource = self.debug_auth
 
@@ -900,12 +900,6 @@ class AuthMiddleware(object):
                             req.context['app'] = app
                             if username_header:
                                 req.context['username'] = username_header
-
-                            # if trying to access internal route ensure that the app is in the allowlist
-                            if hasattr(resource, "internal_allowlist_only"):
-                                if resource.internal_allowlist_only:
-                                    if app_name not in self.allowlisted_apps:
-                                        raise HTTPUnauthorized('This endpoint is only available for internal allowlisted applications', '', [])
                             return
                 # No successful HMACs match, fail auth.
                 if username_header:
@@ -924,8 +918,8 @@ class AuthMiddleware(object):
 
 
 class ACLMiddleware(object):
-    def __init__(self, config={}, debug=False):
-        self.allowlisted_apps = config.get('allowlisted_internal_apps', [])
+    def __init__(self, debug):
+        pass
 
     def process_resource(self, req, resp, resource, params):
         self.process_frontend_routes(req, resource)
@@ -950,10 +944,6 @@ class ACLMiddleware(object):
         # Quickly check the username in the path matches who's logged in
         enforce_user = getattr(resource, 'enforce_user', False)
         app = req.context.get('app')
-
-        # internally allowlisted apps have access to all internal data
-        if req.context.get('app', {}).get('name') in self.allowlisted_apps:
-            return
 
         if not req.context['username']:
             # Check if we need to raise 401s when user must be enforced
@@ -1483,6 +1473,7 @@ class Incidents(object):
     allow_read_no_auth = True
 
     def __init__(self, config):
+
         # if external sender is enabled forward message query through external sender api
         external_sender_configs = config.get('external_sender', {})
         self.external_sender_incident_processing = external_sender_configs.get('external_sender_incident_processing', False)
@@ -1492,7 +1483,6 @@ class Incidents(object):
         self.external_sender_version = external_sender_configs.get('external_sender_version')
         # if disable_auth is True, set verify to False
         self.verify = external_sender_configs.get('ca_bundle_path', False)
-        self.custom_incident_handler_dispatcher = CustomIncidentHandlerDispatcher(config)
 
     def on_get(self, req, resp):
         '''
@@ -1701,6 +1691,7 @@ class Incidents(object):
 
                 if not app:
                     raise HTTPBadRequest('Invalid application')
+
             if num_dynamic > 0:
                 target_list = incident_params.get('dynamic_targets', [])
                 if num_dynamic != len(target_list):
@@ -1851,6 +1842,7 @@ class Incident(object):
         self.external_sender_version = external_sender_configs.get('external_sender_version')
         # if disable_auth is True, set verify to False
         self.verify = external_sender_configs.get('ca_bundle_path', False)
+
         self.custom_incident_handler_dispatcher = CustomIncidentHandlerDispatcher(config)
 
     def on_get(self, req, resp, incident_id):
@@ -2589,6 +2581,7 @@ class Notifications(object):
 
         message['application'] = req.context['app']['name']
 
+
         # if external sender is enabled send notification requests there
         if self.external_sender_notification_processing:
             retries = 0
@@ -2602,6 +2595,7 @@ class Notifications(object):
             logger.error("failed posting notification via external sender: %s", r.text)
             resp.status = HTTP_503
             return
+
 
         # If we're using ZK, try that to get leader
         if self.coordinator:
@@ -5806,6 +5800,7 @@ class CategoryOverrides(object):
         resp.status = HTTP_204
 
 
+
 class InternalBuildMessages():
     allow_read_no_auth = False
     internal_allowlist_only = True
@@ -6430,8 +6425,8 @@ def construct_falcon_api(debug, healthcheck_path, allowed_origins, iris_sender_a
     cors = CORS(allow_origins_list=allowed_origins)
     api = API(middleware=[
         ReqBodyMiddleware(),
-        AuthMiddleware(config=config, debug=debug),
-        ACLMiddleware(config=config, debug=debug),
+        AuthMiddleware(debug=debug),
+        ACLMiddleware(debug=debug),
         HeaderMiddleware(),
         cors.middleware
     ])
@@ -6515,6 +6510,7 @@ def construct_falcon_api(debug, healthcheck_path, allowed_origins, iris_sender_a
     api.add_route('/v0/internal/sender_heartbeat/{node_id}', SenderHeartbeat(config))
     api.add_route('/v0/internal/incidents/{node_id}', InternalIncidents(config))
     api.add_route('/v0/internal/sender_peer_count', SenderPeerCount())
+
 
     mobile_config = config.get('iris-mobile', {})
     if mobile_config.get('activated'):
