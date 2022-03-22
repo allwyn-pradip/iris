@@ -2593,8 +2593,7 @@ class Notifications(object):
                     resp.status = HTTP_200
                     return
             logger.error("failed posting notification via external sender: %s", r.text)
-            resp.status = HTTP_503
-            return
+            raise HTTPBadRequest(r.text)
 
 
         # If we're using ZK, try that to get leader
@@ -5837,19 +5836,16 @@ class InternalBuildMessages():
             cursor.close()
             conn.close()
 
-        notification['subject'] = '[%s] %s' % (notification['application'],
-                                               notification.get('subject', ''))
+        notification['subject'] = '[%s] %s' % (notification['application'], notification.get('subject', ''))
         target_list = notification.get('target_list')
         role = notification.get('role')
         if not role and not target_list:
-            logger.warning('Failed to build message with invalid role "%s" from app %s',
-                           role, notification['application'])
+            logger.warning('Failed to build message with invalid role "%s" from app %s', role, notification['application'])
             raise HTTPBadRequest('INVALID role')
 
         target = notification.get('target')
         if not (target or target_list):
-            logger.warning('Failed to build message with invalid target "%s" from app %s',
-                           target, notification['application'])
+            logger.warning('Failed to build message with invalid target "%s" from app %s', target, notification['application'])
             raise HTTPBadRequest('INVALID target')
         expanded_targets = None
         # if role is literal_target skip unrolling
@@ -5884,8 +5880,7 @@ class InternalBuildMessages():
                 except IrisRoleLookupException:
                     expanded_targets = None
             if not expanded_targets and not has_literal_target:
-                logger.warning('Failed to build with invalid role:target "%s:%s" from app %s',
-                               role, target, notification['application'])
+                logger.warning('Failed to build with invalid role:target "%s:%s" from app %s', role, target, notification['application'])
                 raise HTTPBadRequest('INVALID role:target')
 
         sanitize_unicode_dict(notification)
@@ -5894,16 +5889,14 @@ class InternalBuildMessages():
         # needed iris key.
         if 'template' in notification:
             if 'context' not in notification:
-                logger.warning('Failed to build due to missing context from app %s',
-                               notification['application'])
+                logger.warning('Failed to build due to missing context from app %s', notification['application'])
                 raise HTTPBadRequest('INVALID context')
             else:
                 # fill in dummy iris meta data
                 notification['context']['iris'] = {}
         elif 'email_html' in notification:
             if not isinstance(notification['email_html'], str):
-                logger.warning('Failed to build with invalid email_html from app %s: %s',
-                               notification['application'], notification['email_html'])
+                logger.warning('Failed to build with invalid email_html from app %s: %s', notification['application'], notification['email_html'])
                 raise HTTPBadRequest('INVALID email_html')
 
         notifications = []
@@ -5929,8 +5922,11 @@ class InternalBuildMessages():
             if not success:
                 logger.warning('Failed to build, could not resolve target contacts %s' % ujson.dumps(notification))
                 continue
-            message = render(message)
-            messages.append(message)
+            try:
+                message = render(message)
+                messages.append(message)
+            except Exception as e:
+                logger.warning('Failed to render message %s with error: %s' % (ujson.dumps(notification), str(e)))
         if len(messages) == 0:
             raise HTTPBadRequest('Failed to build, could not resolve any messages from notification')
 
