@@ -12,6 +12,7 @@ import os
 import random
 import datetime
 import logging
+import importlib
 import jinja2
 from jinja2.sandbox import SandboxedEnvironment
 from urllib.parse import parse_qs
@@ -35,14 +36,15 @@ from . import app_stats
 from .config import load_config
 from iris.vendors.iris_slack import iris_slack
 from iris.sender import auditlog
+from iris.bin.sender import set_target_contact, render
+from iris.utils import sanitize_unicode_dict
 from iris.sender.quota import (get_application_quotas_query, insert_application_quota_query,
                                required_quota_keys, quota_int_keys)
 
 from iris.custom_import import import_custom_module
-from iris.custom_incident_handler import CustomIncidentHandlerDispatcher
 
 from .constants import (
-    XFRAME, XCONTENTTYPEOPTIONS, XXSSPROTECTION, PRIORITY_PRECEDENCE_MAP
+    XFRAME, XCONTENTTYPEOPTIONS, XXSSPROTECTION
 )
 
 from .plugins import init_plugins, find_plugin
@@ -1395,14 +1397,14 @@ class Plans(object):
 
             for index, steps in enumerate(plan_params['steps'], start=1):
 
-                # A plan must have at least one non-optonal notification per step, if it doesn't reject the plan
+                # A plan must have at least one non-optional notification per step, if it doesn't reject the plan
                 only_optional_flag = True
 
                 for step in steps:
                     dynamic = step.get('dynamic_index') is not None
                     step['plan_id'] = plan_id
                     step['step'] = index
-                    # for backwards copatibility check if optional is not defined and set it to 0 if it isn't
+                    # for backwards compatibility check if optional is not defined and set it to 0 if it isn't
                     step.setdefault('optional', 0)
                     if step['optional'] == 0:
                         only_optional_flag = False
@@ -1462,7 +1464,12 @@ class Incidents(object):
     allow_read_no_auth = True
 
     def __init__(self, config):
-        self.custom_incident_handler_dispatcher = CustomIncidentHandlerDispatcher(config)
+        custom_incident_handler_module = config.get('custom_incident_handler_module')
+        if custom_incident_handler_module is not None:
+            module = importlib.import_module(custom_incident_handler_module)
+            self.custom_incident_handler_module = getattr(module, 'IncidentHandler')(config)
+        else:
+            self.custom_incident_handler_module = None
 
     def on_get(self, req, resp):
         '''
@@ -1624,8 +1631,6 @@ class Incidents(object):
         if 'plan' not in incident_params:
             raise HTTPBadRequest('missing plan name attribute')
 
-        app = req.context['app']
-
         with db.guarded_session() as session:
             plan_id = session.execute('SELECT `plan_id` FROM `plan_active` WHERE `name` = :plan',
                                       {'plan': incident_params['plan']}).scalar()
@@ -1636,7 +1641,8 @@ class Incidents(object):
                                           'WHERE `plan_id` = :plan_id',
                                           {'plan_id': plan_id}).scalar()
 
-            # Support overriding the app which created this incident
+            app = req.context['app']
+
             if 'application' in incident_params:
                 if not req.context['app']['allow_other_app_incidents']:
                     raise HTTPForbidden(
@@ -1647,7 +1653,6 @@ class Incidents(object):
 
                 if not app:
                     raise HTTPBadRequest('Invalid application')
-
             if num_dynamic > 0:
                 target_list = incident_params.get('dynamic_targets', [])
                 if num_dynamic != len(target_list):
@@ -1741,12 +1746,12 @@ class Incidents(object):
             'id': incident_id,
             'plan': incident_params['plan'],
             'created': int(time.time()),
-            'application': app['name'],
+            'application': req.context['app']['name'],
             'context': context
         }
 
         # optional incident handler to do additional tasks after the incident has been created
-        if self.custom_incident_handler_dispatcher.handlers:
+        if self.custom_incident_handler_module is not None:
             connection = db.engine.raw_connection()
             cursor = connection.cursor(db.dict_cursor)
 
@@ -1759,8 +1764,6 @@ class Incidents(object):
             step = 0
             steps = []
             cursor.execute(single_plan_query_steps, plan_id)
-            highest_seen_priority_rank = -1
-            incident_data['priority'] = ''
             for notification in cursor:
                 s = notification['step']
                 if s != step:
@@ -1769,26 +1772,22 @@ class Incidents(object):
                     step = s
                 else:
                     l.append(notification)
-
-                # calculate priority for this incident based on the most severe priority
-                # across all notifications within the plan
-                priority_name = notification['priority']
-                priority_rank = PRIORITY_PRECEDENCE_MAP.get(priority_name)
-                if priority_rank is not None and priority_rank > highest_seen_priority_rank:
-                    highest_seen_priority_rank = priority_rank
-                    incident_data['priority'] = priority_name
-
             plan_details['steps'] = steps
             connection.close()
             incident_data["plan_details"] = plan_details
-            self.custom_incident_handler_dispatcher.process_create(incident_data)
+            self.custom_incident_handler_module.process_create(incident_data)
 
 
 class Incident(object):
     allow_read_no_auth = True
 
     def __init__(self, config):
-        self.custom_incident_handler_dispatcher = CustomIncidentHandlerDispatcher(config)
+        custom_incident_handler_module = config.get('custom_incident_handler_module')
+        if custom_incident_handler_module is not None:
+            module = importlib.import_module(custom_incident_handler_module)
+            self.custom_incident_handler_module = getattr(module, 'IncidentHandler')(config)
+        else:
+            self.custom_incident_handler_module = None
 
     def on_get(self, req, resp, incident_id):
         '''
@@ -1930,7 +1929,7 @@ class Incident(object):
                                  'active': is_active})
 
         # optional incident handler to do additional tasks after the incident has been claimed
-        if self.custom_incident_handler_dispatcher.handlers:
+        if self.custom_incident_handler_module is not None:
             connection = db.engine.raw_connection()
             cursor = connection.cursor(db.dict_cursor)
 
@@ -1943,14 +1942,19 @@ class Incident(object):
             incident_data['context'] = ujson.loads(incident_data['context'])
             cursor.close()
             connection.close()
-            self.custom_incident_handler_dispatcher.process_claim(incident_data)
+            self.custom_incident_handler_module.process_claim(incident_data)
 
 
 class Resolved(object):
     allow_read_no_auth = False
 
     def __init__(self, config):
-        self.custom_incident_handler_dispatcher = CustomIncidentHandlerDispatcher(config)
+        custom_incident_handler_module = config.get('custom_incident_handler_module')
+        if custom_incident_handler_module is not None:
+            module = importlib.import_module(custom_incident_handler_module)
+            self.custom_incident_handler_module = getattr(module, 'IncidentHandler')(config)
+        else:
+            self.custom_incident_handler_module = None
 
     def on_post(self, req, resp, incident_id):
 
@@ -1976,7 +1980,7 @@ class Resolved(object):
                                  'resolved': resolved})
 
         # optional incident handler to do additional tasks after the incident has been resolved
-        if self.custom_incident_handler_dispatcher.handlers:
+        if self.custom_incident_handler_module is not None:
             connection = db.engine.raw_connection()
             cursor = connection.cursor(db.dict_cursor)
 
@@ -1989,14 +1993,19 @@ class Resolved(object):
 
             cursor.close()
             connection.close()
-            self.custom_incident_handler_dispatcher.process_resolve(incident_data)
+            self.custom_incident_handler_module.process_resolve(incident_data)
 
 
 class ClaimIncidents(object):
     allow_read_no_auth = False
 
     def __init__(self, config):
-        self.custom_incident_handler_dispatcher = CustomIncidentHandlerDispatcher(config)
+        custom_incident_handler_module = config.get('custom_incident_handler_module')
+        if custom_incident_handler_module is not None:
+            module = importlib.import_module(custom_incident_handler_module)
+            self.custom_incident_handler_module = getattr(module, 'IncidentHandler')(config)
+        else:
+            self.custom_incident_handler_module = None
 
     def on_post(self, req, resp):
         params = ujson.loads(req.context['body'])
@@ -2033,7 +2042,7 @@ class ClaimIncidents(object):
                                  'unclaimed': unclaimed})
 
         # optional incident handler to do additional tasks after the incidents have been claimed
-        if self.custom_incident_handler_dispatcher.handlers:
+        if self.custom_incident_handler_module is not None:
             connection = db.engine.raw_connection()
             cursor = connection.cursor(db.dict_cursor)
             for incident_id in incident_ids:
@@ -2044,7 +2053,7 @@ class ClaimIncidents(object):
                 cursor.execute(single_incident_query_comments, incident_id)
                 incident_data['comments'] = cursor.fetchall()
                 incident_data['context'] = ujson.loads(incident_data['context'])
-                self.custom_incident_handler_dispatcher.process_claim(incident_data)
+                self.custom_incident_handler_module.process_claim(incident_data)
             cursor.close()
             connection.close()
 
@@ -5399,6 +5408,189 @@ class CategoryOverrides(object):
         resp.status = HTTP_204
 
 
+class InternalBuildMessages():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def on_get(self, req, resp):
+        notification = ujson.loads(req.context['body'])
+        if 'application' not in notification:
+            logger.warning('Dropping OOB message due to missing application key')
+            raise HTTPBadRequest('INVALID application')
+
+        notification['subject'] = '[%s] %s' % (notification['application'],
+                                               notification.get('subject', ''))
+        target_list = notification.get('target_list')
+        role = notification.get('role')
+        if not role and not target_list:
+            logger.warning('Dropping OOB message with invalid role "%s" from app %s',
+                           role, notification['application'])
+            raise HTTPBadRequest('INVALID role')
+
+        target = notification.get('target')
+        if not (target or target_list):
+            logger.warning('Dropping OOB message with invalid target "%s" from app %s',
+                           target, notification['application'])
+            raise HTTPBadRequest('INVALID target')
+        expanded_targets = None
+        # if role is literal_target skip unrolling
+        if not notification.get('unexpanded'):
+            # For multi-recipient notifications, pre-populate destination with literal targets,
+            # then expand the remaining
+            has_literal_target = False
+            if target_list:
+                expanded_targets = []
+                notification['destination'] = []
+                notification['bcc_destination'] = []
+                for t in target_list:
+                    role = t['role']
+                    target = t['target']
+                    bcc = t.get('bcc')
+                    try:
+                        if role == 'literal_target':
+                            if bcc:
+                                notification['bcc_destination'].append(target)
+                            else:
+                                notification['destination'].append(target)
+                            has_literal_target = True
+                        else:
+                            expanded = cache.targets_for_role(role, target)
+                            expanded_targets += [{'target': e, 'bcc': bcc} for e in expanded]
+                    except IrisRoleLookupException:
+                        # Maintain best-effort delivery for remaining targets if one fails to resolve
+                        continue
+            else:
+                try:
+                    expanded_targets = sender_cache.targets_for_role(role, target)
+                except IrisRoleLookupException:
+                    expanded_targets = None
+            if not expanded_targets and not has_literal_target:
+                logger.warning('Dropping OOB message with invalid role:target "%s:%s" from app %s',
+                               role, target, notification['application'])
+                raise HTTPBadRequest('INVALID role:target')
+
+        sanitize_unicode_dict(notification)
+
+        # If we're rendering this using templates+context instead of body, fill in the
+        # needed iris key.
+        if 'template' in notification:
+            if 'context' not in notification:
+                logger.warning('Dropping OOB message due to missing context from app %s',
+                               notification['application'])
+                raise HTTPBadRequest('INVALID context')
+            else:
+                # fill in dummy iris meta data
+                notification['context']['iris'] = {}
+        elif 'email_html' in notification:
+            if not isinstance(notification['email_html'], str):
+                logger.warning('Dropping OOB message with invalid email_html from app %s: %s',
+                               notification['application'], notification['email_html'])
+                raise HTTPBadRequest('INVALID email_html')
+
+        notifications = []
+        if notification.get('unexpanded'):
+            notification['destination'] = notification['target']
+            notifications.append(notification)
+        elif notification.get('multi-recipient'):
+            notification['target'] = expanded_targets
+            notifications.append(notification)
+        else:
+            for _target in expanded_targets:
+                temp_notification = notification.copy()
+                temp_notification['target'] = _target
+                notifications.append(temp_notification)
+
+        messages = []
+        for notification in notifications:
+            message = set_target_contact(notification)[1]
+            message = render(message)
+            messages.append(message)
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(messages)
+
+
+class InternalApplicationsAuth():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def on_get(self, req, resp):
+
+        connection = db.engine.raw_connection()
+        cursor = connection.cursor(db.dict_cursor)
+        cursor.execute('''SELECT `name`, `key` FROM `application` WHERE `auth_only` is False''')
+        apps = cursor.fetchall()
+
+        cursor.close()
+        connection.close()
+
+        payload = apps
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(payload)
+
+
+class InternalIncident():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def on_post(self, req, resp, incident_id):
+
+        body = ujson.loads(req.context['body'])
+
+        if 'current_step' not in body or 'active' not in body:
+            raise HTTPBadRequest('Missing required fields "current_step" or "active" in body')
+
+        if not isinstance(body['current_step'], int):
+            raise HTTPBadRequest('"step" field must be an integer"')
+
+        connection = db.engine.raw_connection()
+        cursor = connection.cursor(db.dict_cursor)
+
+        cursor.execute(''' SELECT EXISTS (SELECT `id` from `incident` where `id` = %s) as valid''', incident_id)
+        if not cursor.fetchone().get('valid'):
+            cursor.close()
+            connection.close()
+            raise HTTPBadRequest('Invalid incident id')
+
+        if body['active']:
+            active = 1
+        else:
+            active = 0
+
+        cursor.execute('''UPDATE `incident` SET `current_step` = %s, `active` = %s WHERE `id` = %s''', (body['current_step'], active, incident_id))
+        connection.commit()
+        cursor.close()
+        connection.close()
+        resp.status = HTTP_200
+
+
+class InternalTarget():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def on_get(self, req, resp):
+
+        role = req.get_param('role', required=True)
+        target = req.get_param('target', required=True)
+
+        payload = {"error": None, "users": {}}
+        try:
+            names = sender_cache.targets_for_role(role, target)
+        except IrisRoleLookupException as e:
+            names = None
+            payload['error'] = str(e)
+            resp.status = HTTP_400
+            resp.body = ujson.dumps(payload)
+            return
+
+        for username in names:
+            user_data = get_user_details(username)
+            payload['users'][username] = user_data
+
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(payload)
+
+
+
 def update_cache_worker():
     while True:
         logger.debug('Reinitializing cache')
@@ -5486,6 +5678,13 @@ def construct_falcon_api(debug, healthcheck_path, allowed_origins, iris_sender_a
     api.add_route('/v0/users/{username}/slackid', UserToSlackID(config))
     api.add_route('/v0/users/{username}/categories/{application}', CategoryOverrides())
 
+
+    api.add_route('/v0/internal/auth/applications', InternalApplicationsAuth())
+    api.add_route('/v0/internal/incident/{incident_id}', InternalIncident())
+    api.add_route('/v0/internal/target', InternalTarget())
+    api.add_route('/v0/internal/build_message', InternalBuildMessages())
+
+    
     mobile_config = config.get('iris-mobile', {})
     if mobile_config.get('activated'):
         api.add_route('/v0/devices', Devices(mobile_config))
