@@ -6366,6 +6366,7 @@ def init_webhooks(config, api):
 
 def get_api(config):
     db.init(config)
+    cache.init()
     spawn(update_cache_worker)
     init_plugins(config.get('plugins', {}))
     init_validators(config.get('validators', []))
