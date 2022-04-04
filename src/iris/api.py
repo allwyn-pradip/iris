@@ -1543,6 +1543,35 @@ class Incidents(object):
                 WHERE `target`.`name` IN %s
             )''')
             sql_values.append(tuple(target))
+        if self.external_sender_incident_processing and target:
+            message_query_string = 'messages?limit=500'
+            if req.params.get('created__ge'):
+                message_query_string += '&sent__ge=' + str(req.params.get('created__ge'))
+            if req.params.get('created__le'):
+                message_query_string += '&sent__le=' + str(req.params.get('created__le'))
+            for t in target:
+                message_query_string = message_query_string + '&target=' + str(t)
+            # get messages for incident
+            try:
+                external_sender_client = client.IrisClient(self.external_sender_address, self.external_sender_version, self.external_sender_app, self.external_sender_key)
+                r = external_sender_client.get(message_query_string, verify=self.verify)
+                if r.ok:
+                    incident_IDs = []
+                    messages = r.json()
+                    if len(messages) > 0:
+                        for message in messages:
+                            incident_IDs.append(message.get('incident_id'))
+                        where.append('''`incident`.`id` IN %s''')
+                        sql_values.append(tuple(incident_IDs))
+                    elif target:
+                        # if target field is specified and there are no matching messages that means there are no incidents that match the query
+                        resp.status = HTTP_200
+                        resp.body = ujson.dumps([])
+                        return
+                else:
+                    logger.error('failed retrieving messages from external sender %s', r.text)
+            except Exception as e:
+                logger.exception('failed to establish connection with iris message processor')
         if not (where or query_limit):
             raise HTTPBadRequest('Incident query too broad, add filter or limit')
         if where:
