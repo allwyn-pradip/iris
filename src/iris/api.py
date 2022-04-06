@@ -5592,6 +5592,639 @@ class CategoryOverrides(object):
         resp.status = HTTP_204
 
 
+class InternalRenderJinja():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def __init__(self):
+        # Autoescape needs to be False to avoid html-encoding ampersands in emails.
+        # in emails, html is allowed and ampersands are escaped with markdown's renderer.
+        self.env = SandboxedEnvironment(autoescape=False)
+
+    def on_get(self, req, resp):
+        req_body = ujson.loads(req.context['body'])
+        if 'template_str' not in req_body or 'context' not in req_body:
+            raise HTTPBadRequest('Missing required attributes, must have template_str and context')
+        template_str = req_body.get('template_str')
+        context = req_body.get('context')
+
+        try:
+            render_env = self.env.from_string(template_str)
+        except Exception as e:
+            raise HTTPBadRequest('Failed to render jinja with err: %s' % str(e))
+        else:
+            try:
+                rendered_body = render_env.render(**context)
+            except Exception as e:
+                raise HTTPBadRequest('Failed to render jinja with err: %s' % str(e))
+
+        resp.status = HTTP_200
+        resp.body = ujson.dumps({"rendered_body": rendered_body})
+
+
+class InternalBuildMessages():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def __init__(self, config):
+        self.cfg = config
+
+    def on_get(self, req, resp):
+        notification = ujson.loads(req.context['body'])
+        if 'application' not in notification:
+            logger.warning('Failed to build due to missing application key')
+            raise HTTPBadRequest('INVALID application')
+
+        if notification.get('role') == 'literal_target':
+            notification['unexpanded'] = True
+
+        if "incident_id" in notification and "dynamic_index" in notification:
+            # check if plan is dynamic and retrieve role & target for incident
+            conn = db.engine.raw_connection()
+            cursor = conn.cursor()
+
+            # resolve dynamic role and target
+            cursor.execute('''
+                SELECT `target_role`.`name` as role, `target`.`name` as target FROM `dynamic_plan_map`
+                JOIN `target` ON `target`.`id` = `dynamic_plan_map`.`target_id`
+                JOIN `target_role` ON `dynamic_plan_map`.`role_id` = `target_role`.`id`
+                WHERE `dynamic_plan_map`.`incident_id` = %s AND `dynamic_plan_map`.`dynamic_index` = %s
+                ''', (notification["incident_id"], notification["dynamic_index"]))
+            result = cursor.fetchone()
+            if result is not None:
+                dynamic_role, dynamic_target = result
+                notification['target'] = dynamic_target
+                notification['role'] = dynamic_role
+            cursor.close()
+            conn.close()
+
+        target_list = notification.get('target_list')
+        role = notification.get('role')
+        if not role and not target_list:
+            logger.warning('Failed to build message with invalid role "%s" from app %s', role, notification['application'])
+            raise HTTPBadRequest('INVALID role')
+
+        target = notification.get('target')
+        if not (target or target_list):
+            logger.warning('Failed to build message with invalid target "%s" from app %s', target, notification['application'])
+            raise HTTPBadRequest('INVALID target')
+        expanded_targets = None
+        # if role is literal_target skip unrolling
+        if not notification.get('unexpanded'):
+            # For multi-recipient notifications, pre-populate destination with literal targets,
+            # then expand the remaining
+            has_literal_target = False
+            if target_list:
+                expanded_targets = []
+                notification['destination'] = []
+                notification['bcc_destination'] = []
+                for t in target_list:
+                    role = t['role']
+                    target = t['target']
+                    bcc = t.get('bcc')
+                    try:
+                        if role == 'literal_target':
+                            if bcc:
+                                notification['bcc_destination'].append(target)
+                            else:
+                                notification['destination'].append(target)
+                            has_literal_target = True
+                        else:
+                            names = direct_lookup(self.cfg, role, target)
+                            expanded_targets += [{'target': e, 'bcc': bcc} for e in names]
+                    except IrisRoleLookupException:
+                        # Maintain best-effort delivery for remaining targets if one fails to resolve
+                        continue
+            else:
+                try:
+                    expanded_targets = direct_lookup(self.cfg, role, target)
+                except IrisRoleLookupException:
+                    expanded_targets = None
+            if not expanded_targets and not has_literal_target:
+                logger.warning('Failed to build with invalid role:target "%s:%s" from app %s', role, target, notification['application'])
+                raise HTTPBadRequest('INVALID role:target')
+
+        sanitize_unicode_dict(notification)
+
+        # If we're rendering this using templates+context instead of body, fill in the
+        # needed iris key.
+        if 'template' in notification:
+            if 'context' not in notification:
+                logger.warning('Failed to build due to missing context from app %s', notification['application'])
+                raise HTTPBadRequest('INVALID context')
+            elif 'iris' not in notification['context']:
+                # fill in dummy iris meta data for OOB notifications messages
+                notification['context']['iris'] = {}
+        elif 'email_html' in notification:
+            if not isinstance(notification['email_html'], str):
+                logger.warning('Failed to build with invalid email_html from app %s: %s', notification['application'], notification['email_html'])
+                raise HTTPBadRequest('INVALID email_html')
+
+        notifications = []
+        if notification.get('unexpanded'):
+            notification['destination'] = notification['target']
+            notifications.append(notification)
+        elif notification.get('multi-recipient'):
+            notification['target'] = expanded_targets
+            notifications.append(notification)
+        else:
+            for _target in expanded_targets:
+                temp_notification = notification.copy()
+                temp_notification['target'] = _target
+                notifications.append(temp_notification)
+
+        messages = []
+        for notification in notifications:
+            success = False
+            try:
+                success, message = set_target_contact(notification)
+            except (ValueError, TypeError):
+                success = False
+            if not success:
+                logger.warning('Failed to build, could not resolve target contacts %s' % ujson.dumps(notification))
+                continue
+            try:
+                message = render(message)
+                messages.append(message)
+            except Exception as e:
+                logger.warning('Failed to render message %s with error: %s' % (ujson.dumps(notification), str(e)))
+        if len(messages) == 0:
+            raise HTTPBadRequest('Failed to build, could not resolve any messages from notification')
+
+        conn = db.engine.raw_connection()
+        cursor = conn.cursor()
+        # Find custom sender address for application, currently only emails are supported
+        cursor.execute('''
+            SELECT `sender_address` FROM `application_custom_sender_address`
+            JOIN `application` on `application_custom_sender_address`.`application_id` = `application`.`id`
+            JOIN `mode` on `application_custom_sender_address`.`mode_id` = `mode`.`id`
+            WHERE `application`.`name` = %s AND `mode`.`name` = %s
+            ''', (notification['application'], 'email'))
+        sender_address = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if sender_address is not None:
+            for idx, message in enumerate(messages):
+                # add sender address as message attribute to emails
+                if message['mode'] == 'email':
+                    message['sender_address'] = sender_address[0]
+                    messages[idx] = message
+
+        if notification.get('multi-recipient'):
+            # if multirecipient separate into multiple messages
+            # TODO: rewrite target expansion to preserve proper multirecipient target->destination relationship, for now format messages like literal_target role
+            split_msgs = []
+            multi_msg = messages[0]
+            for dest in multi_msg["destination"]:
+                # copy message and format as a single message
+                individual_msg = multi_msg.copy()
+                del individual_msg["destination"]
+                del individual_msg["bcc_destination"]
+                del individual_msg["target_list"]
+                individual_msg["destination"] = dest
+                individual_msg["target"] = dest
+                split_msgs.append(individual_msg)
+            for bcc_dest in multi_msg["bcc_destination"]:
+                # copy message and format as a single message
+                individual_msg = multi_msg.copy()
+                del individual_msg["destination"]
+                del individual_msg["bcc_destination"]
+                del individual_msg["target_list"]
+                individual_msg["bcc_destination"] = bcc_dest
+                individual_msg["target"] = bcc_dest
+                split_msgs.append(individual_msg)
+            # replace the multi-message formatted list with the individual formatted messages list
+            messages = split_msgs
+
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(messages)
+
+
+class InternalApplicationsAuth():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def on_get(self, req, resp):
+
+        connection = db.engine.raw_connection()
+        cursor = connection.cursor(db.dict_cursor)
+        cursor.execute('''SELECT `name`, `key` FROM `application` WHERE `auth_only` is False''')
+        apps = cursor.fetchall()
+
+        cursor.close()
+        connection.close()
+
+        payload = apps
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(payload)
+
+
+class InternalIncident():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def on_post(self, req, resp, incident_id):
+
+        body = ujson.loads(req.context['body'])
+
+        if 'current_step' not in body or 'active' not in body:
+            raise HTTPBadRequest('Missing required fields "current_step" or "active" in body')
+
+        if not isinstance(body['current_step'], int):
+            raise HTTPBadRequest('"step" field must be an integer"')
+
+        connection = db.engine.raw_connection()
+        cursor = connection.cursor(db.dict_cursor)
+
+        cursor.execute(''' SELECT EXISTS (SELECT `id` from `incident` where `id` = %s) as valid''', incident_id)
+        if not cursor.fetchone().get('valid'):
+            cursor.close()
+            connection.close()
+            raise HTTPBadRequest('Invalid incident id')
+
+        if body['active']:
+            active = 1
+        else:
+            active = 0
+
+        cursor.execute('''UPDATE `incident` SET `current_step` = %s, `active` = %s WHERE `id` = %s''', (body['current_step'], active, incident_id))
+        connection.commit()
+        cursor.close()
+        connection.close()
+        resp.status = HTTP_200
+
+
+class InternalTarget():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def __init__(self, config):
+        self.cfg = config
+
+    def on_get(self, req, resp):
+
+        role = req.get_param('role', required=True)
+        target = req.get_param('target', required=True)
+
+        payload = {"error": None, "users": {}}
+        names = direct_lookup(self.cfg, role, target)
+
+        for username in names:
+            user_data = get_user_details(username)
+            payload['users'][username] = user_data
+
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(payload)
+
+
+def direct_lookup(config, role, target):
+    targets = None
+    for role_lookup in get_role_lookups(config):
+        targets = role_lookup.get(role, target)
+        if targets is not None:
+            break
+        else:
+            targets = []
+    return targets
+
+
+class SenderPeerCount():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def on_get(self, req, resp):
+        connection = db.engine.raw_connection()
+        cursor = connection.cursor(db.dict_cursor)
+        cursor.execute("SELECT count(`node_id`) as peer_count FROM `IMP_cluster_members`")
+        result = cursor.fetchone()
+        cursor.close()
+        connection.close()
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(result)
+
+
+class SenderHeartbeat():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def __init__(self, config):
+        cfg = config.get("iris-message-processor", {})
+        self.zk_hosts = cfg.get("zk_hosts", "127.0.0.1:2181")
+        self.lock_path = cfg.get("lock_path", "/iris_message_processor/db_locks/bucket_lock")
+        self.number_of_buckets = cfg.get("number_of_buckets", 100)
+        self.sender_ttl = config.get("sender_ttl", 60)
+        self.zk_debug = config.get("zk_debug", True)
+
+    def on_get(self, req, resp, node_id):
+        payload = {}
+
+        # configure sql client
+        connection = db.engine.raw_connection()
+        cursor = connection.cursor(db.dict_cursor)
+
+        if self.zk_debug:
+            # use exitstack to replace zookeeper lock context manager for testing
+            lock = ExitStack()
+        else:
+            # configure zookeeper client
+            zk = KazooClient(self.zk_hosts)
+            zk.start()
+            node_uuid = node_id + "-" + str(uuid.uuid4())
+            lock = zk.Lock(self.lock_path, node_uuid)
+        # wait until we are able to acquire the global lock before proceeding
+        with lock:
+
+            # check if node is already a member of the cluster and if new member assign it some buckets
+            cursor.execute("SELECT * FROM IMP_cluster_members where node_id = %s", node_id)
+            if not cursor.fetchone():
+
+                cursor.execute("select * from IMP_cluster_members")
+                cluster_members = cursor.fetchall()
+
+                # node was not previously a member of this cluster so figure out what nodes to assign to itself
+                cursor.execute(
+                    "INSERT INTO IMP_cluster_members VALUES(%s, %s, NOW())", (node_id, req.remote_addr))
+
+                # node is the first node in the cluster, directly assign all buckets to it
+                if len(cluster_members) == 0:
+                    insert_sql = "INSERT INTO IMP_bucket_assignments VALUES"
+                    insert_values = []
+                    # build bulk insert sql query
+                    insert_sql += ("(%s, %s)," * self.number_of_buckets)[:-1]
+                    for i in range(self.number_of_buckets):
+                        insert_values.append(node_id)
+                        insert_values.append(i)
+                    cursor.execute(insert_sql, tuple(insert_values))
+                    connection.commit()
+
+                # node is not first find buckets to reallocate to itself from other nodes
+                else:
+
+                    node_to_assigned_buckets = {}
+                    node_to_change_buckets = {}
+                    for row in cluster_members:
+                        node_to_assigned_buckets[row.get("node_id")] = []
+                        node_to_change_buckets[row.get("node_id")] = []
+
+                    # fetch data from bucket changes table
+                    cursor.execute("SELECT * FROM IMP_bucket_changes")
+                    bucket_changes_results = cursor.fetchall()
+                    for row in bucket_changes_results:
+                        node_to_change_buckets.get(
+                            row["node_id"], []).append(row.get("bucket_id"))
+
+                    # fetch data from bucket assignments table for buckets that do not have any pending changes
+                    cursor.execute(
+                        "SELECT * FROM IMP_bucket_assignments WHERE IMP_bucket_assignments.bucket_id NOT IN (SELECT IMP_bucket_changes.bucket_id from IMP_bucket_changes)")
+                    assigned_buckets = cursor.fetchall()
+                    for row in assigned_buckets:
+                        node_to_assigned_buckets.get(
+                            row["node_id"], []).append(row["bucket_id"])
+
+                    # how many total buckets does the new node need
+                    required_buckets = math.floor(self.number_of_buckets / (len(cluster_members) + 1))
+
+                    # go node by node through existing nodes to determine what buckets we are going to take from each
+                    for row in cluster_members:
+                        # keep track af how many buckets we have reassigned for each node
+                        buckets_reassigned = 0
+                        donor_node_id = row.get("node_id")
+                        donor_buckets_total = len(node_to_change_buckets.get(
+                            donor_node_id, [])) + len(node_to_assigned_buckets.get(donor_node_id, []))
+                        buckets_to_take = donor_buckets_total - required_buckets
+
+                        if buckets_to_take > 0:
+                            # prioritize reassigning buckets in IMP_bucket_changes to minimize bucket shuffling
+                            for bucket in node_to_change_buckets.get(donor_node_id):
+                                cursor.execute(
+                                    "UPDATE IMP_bucket_changes SET node_id = %s WHERE bucket_id = %s", (node_id, bucket))
+                                buckets_reassigned += 1
+                                if buckets_reassigned >= buckets_to_take:
+                                    break
+                            # we still need more buckets from this donor node so take buckets from IMP_bucket_assignments
+                            if buckets_reassigned < buckets_to_take:
+                                for bucket in node_to_assigned_buckets.get(donor_node_id):
+                                    cursor.execute(
+                                        "INSERT INTO IMP_bucket_changes VALUES(%s,%s)", (node_id, bucket))
+                                    buckets_reassigned += 1
+                                    if buckets_reassigned >= buckets_to_take:
+                                        break
+
+                    connection.commit()
+            else:
+                # update last modified time to renew our TTL
+                cursor.execute(
+                    "UPDATE IMP_cluster_members SET last_modified = NOW() WHERE node_id = %s", node_id)
+
+            # check if there are any buckets that belong to this node that we have to give up
+
+            cursor.execute(
+                "SELECT * FROM IMP_bucket_changes WHERE bucket_id IN (SELECT bucket_id FROM IMP_bucket_assignments WHERE node_id = %s)", node_id)
+            bucket_changes_results = cursor.fetchall()
+            for row in bucket_changes_results:
+                # release buckets to the node that requested them
+                cursor.execute("UPDATE IMP_bucket_assignments SET node_id = %s WHERE bucket_id = %s",
+                               (row["node_id"], row["bucket_id"]))
+                # delete IMP_bucket_changes request for teh bucket we just reassigned
+                cursor.execute("DELETE FROM IMP_bucket_changes WHERE node_id = %s AND bucket_id = %s",
+                               (row["node_id"], row["bucket_id"]))
+            connection.commit()
+
+            # check if there are are nodes who's cluster membership TTL has expired and redistribute their buckets
+
+            # if a node has gone more than TTL seconds without checking in kick it out of the cluster
+            cursor.execute(
+                "SELECT * FROM IMP_cluster_members WHERE TIMESTAMPDIFF(SECOND,last_modified, NOW()) >= %s", self.sender_ttl)
+            dead_nodes = cursor.fetchall()
+
+            if len(dead_nodes) > 0:
+                cursor.execute(
+                    "SELECT * FROM IMP_cluster_members WHERE TIMESTAMPDIFF(SECOND,last_modified, NOW()) < %s", self.sender_ttl)
+                alive_nodes = cursor.fetchall()
+
+                # apply any changes that were already pending for the dead nodes
+                for dead_node in dead_nodes:
+                    cursor.execute(
+                        "SELECT * FROM IMP_bucket_changes WHERE bucket_id IN (SELECT bucket_id FROM IMP_bucket_assignments WHERE node_id = %s)", dead_node["node_id"])
+                    bucket_changes_results = cursor.fetchall()
+                    for row in bucket_changes_results:
+                        # release buckets to the node that requested them
+                        cursor.execute("UPDATE IMP_bucket_assignments SET node_id = %s WHERE bucket_id = %s", (
+                            row["node_id"], row["bucket_id"]))
+                        # delete IMP_bucket_changes request for teh bucket we just reassigned
+                        cursor.execute("DELETE FROM IMP_bucket_changes WHERE node_id = %s AND bucket_id = %s", (
+                            row["node_id"], row["bucket_id"]))
+
+                # give away the rest of the dead nodes' buckets in round robin fashion
+                cursor.execute("SELECT * FROM IMP_bucket_assignments WHERE IMP_bucket_assignments.node_id IN (SELECT IMP_cluster_members.node_id FROM IMP_cluster_members WHERE TIMESTAMPDIFF(SECOND,last_modified, NOW()) >= %s)", self.sender_ttl)
+                dead_node_buckets = cursor.fetchall()
+
+                i = 0
+                for bucket in dead_node_buckets:
+                    if i >= len(alive_nodes):
+                        i = 0
+                    cursor.execute("UPDATE IMP_bucket_assignments SET node_id = %s WHERE bucket_id = %s",
+                                   (alive_nodes[i]["node_id"], bucket["bucket_id"]))
+                    i += 1
+                connection.commit()
+                #  delete dead nodes from cluster membership
+                dead_node_ids = [node["node_id"] for node in dead_nodes]
+                with db.guarded_session() as session:
+                    session.execute("DELETE FROM IMP_cluster_members WHERE node_id IN :dead_node_ids", {"dead_node_ids": tuple(dead_node_ids)})
+                    session.commit()
+
+            if self.zk_debug:
+                cursor.execute("SELECT * FROM IMP_bucket_assignments")
+                bucket_assignments = cursor.fetchall()
+                payload = bucket_assignments
+
+        cursor.close()
+        connection.close()
+
+        if not self.zk_debug:
+            zk.stop()
+            zk.close()
+
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(payload)
+
+    def on_delete(self, req, resp, node_id):
+        # gracefully remove node from the cluster
+
+        # configure sql client
+        payload = {}
+        connection = db.engine.raw_connection()
+        cursor = connection.cursor(db.dict_cursor)
+
+        if self.zk_debug:
+            # use exitstack to replace zookeeper lock context manager for testing
+            lock = ExitStack()
+        else:
+            # configure zookeeper client
+            zk = KazooClient(self.zk_hosts)
+            zk.start()
+            node_uuid = node_id + "-" + str(uuid.uuid4())
+            lock = zk.Lock(self.lock_path, node_uuid)
+        # wait until we are able to acquire the global lock before proceeding
+        with lock:
+
+            # fetch list of healthy nodes
+            cursor.execute(
+                "SELECT * FROM IMP_cluster_members WHERE TIMESTAMPDIFF(SECOND,last_modified, NOW()) < %s AND node_id != %s", (self.sender_ttl, node_id))
+            alive_nodes = cursor.fetchall()
+
+            # take care of any pending bucket changes for this node
+            cursor.execute(
+                "SELECT * FROM IMP_bucket_changes WHERE bucket_id IN (SELECT bucket_id FROM IMP_bucket_assignments WHERE node_id = %s)", node_id)
+            bucket_changes_results = cursor.fetchall()
+            for row in bucket_changes_results:
+                # release buckets to the node that requested them
+                cursor.execute("UPDATE IMP_bucket_assignments SET node_id = %s WHERE bucket_id = %s", (
+                    row["node_id"], row["bucket_id"]))
+                # delete IMP_bucket_changes request for the bucket we just reassigned
+                cursor.execute("DELETE FROM IMP_bucket_changes WHERE node_id = %s AND bucket_id = %s", (
+                    row["node_id"], row["bucket_id"]))
+
+            # give away the rest of the node's buckets in round robin fashion
+            cursor.execute("SELECT * FROM IMP_bucket_assignments WHERE IMP_bucket_assignments.node_id = %s", node_id)
+            dead_node_buckets = cursor.fetchall()
+
+            i = 0
+            for bucket in dead_node_buckets:
+                if i >= len(alive_nodes):
+                    i = 0
+                cursor.execute("UPDATE IMP_bucket_assignments SET node_id = %s WHERE bucket_id = %s", (alive_nodes[i]["node_id"], bucket["bucket_id"]))
+                i += 1
+
+            #  delete node from cluster membership
+            cursor.execute(
+                "DELETE FROM IMP_cluster_members WHERE node_id = %s", node_id)
+            connection.commit()
+
+        if self.zk_debug:
+            cursor.execute("SELECT * FROM IMP_bucket_assignments")
+            bucket_assignments = cursor.fetchall()
+            payload = bucket_assignments
+        else:
+            zk.stop()
+            zk.close()
+
+        cursor.close()
+        connection.close()
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(payload)
+
+
+class InternalIncidents():
+    allow_read_no_auth = False
+    internal_allowlist_only = True
+
+    def __init__(self, config):
+        external_sender_configs = config.get('external_sender', {})
+        self.external_sender_incident_processing = external_sender_configs.get('external_sender_incident_processing', False)
+        # allow external sender to process incidents into messages if it is in dryrun and will not send them
+        self.external_sender_incident_dryrun = external_sender_configs.get('external_sender_incident_dryrun', False)
+
+    def on_get(self, req, resp, node_id):
+
+        if not (self.external_sender_incident_processing or self.external_sender_incident_dryrun):
+            # do not return any incidents
+            resp.status = HTTP_200
+            resp.body = ujson.dumps([])
+            return
+
+        connection = db.engine.raw_connection()
+        cursor = connection.cursor(db.dict_cursor)
+        cursor.execute('''SELECT `id` FROM `incident` WHERE `active` = 1 AND `bucket_id` IN (SELECT `bucket_id` FROM `IMP_bucket_assignments` WHERE `node_id` = %s)''', node_id)
+        result = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        incident_ids = [row["id"] for row in result]
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(incident_ids)
+
+    def on_post(self, req, resp, node_id):
+
+        body = ujson.loads(req.context['body'])
+
+        if 'incident_ids' not in body:
+            raise HTTPBadRequest('Missing incident ids in POST body')
+
+        if not isinstance(body['incident_ids'], list):
+            raise HTTPBadRequest('incident_ids must be a list')
+
+        if len(body['incident_ids']) < 1:
+            raise HTTPBadRequest('incident_ids list cannot be empty')
+
+        query = incident_query % ', '.join(incident_columns[f] for f in incident_columns)
+        query += ' WHERE `incident`.`active` = 1 AND `incident`.`id` IN %s'
+        sql_values = [tuple(body['incident_ids'])]
+        connection = db.engine.raw_connection()
+        cursor = connection.cursor(db.ss_dict_cursor)
+        cursor.execute(query, sql_values)
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(stream_incidents_with_context(cursor, False))
+        cursor.close()
+        connection.close()
+
+
+class PlanAggregationSettings():
+    allow_read_no_auth = True
+    internal_allowlist_only = False
+
+    def on_get(self, req, resp):
+
+        connection = db.engine.raw_connection()
+        cursor = connection.cursor(db.dict_cursor)
+        cursor.execute('SELECT `plan`.`id`, `plan`.`name`, `plan`.`threshold_window`, `plan`.`threshold_count`, `plan`.`aggregation_window`, `plan`.`aggregation_reset` FROM `plan` INNER JOIN `plan_active` ON `plan`.`id` = `plan_active`.`plan_id`')
+        result = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        resp.status = HTTP_200
+        resp.body = ujson.dumps(result)
+
+
 def update_cache_worker():
     while True:
         logger.debug('Reinitializing cache')
