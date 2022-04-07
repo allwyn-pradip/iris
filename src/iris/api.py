@@ -35,7 +35,6 @@ from . import app_stats
 from .config import load_config
 from iris.vendors.iris_slack import iris_slack
 from iris.sender import auditlog
-from iris.bin import sender
 from iris.sender.quota import (get_application_quotas_query, insert_application_quota_query,
                                required_quota_keys, quota_int_keys)
 
