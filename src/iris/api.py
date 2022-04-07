@@ -44,7 +44,10 @@ from iris.vendors.iris_slack import iris_slack
 from iris.role_lookup import IrisRoleLookupException
 from iris.sender import auditlog
 from iris.bin import sender
+<<<<<<< HEAD
 from iris.utils import sanitize_unicode_dict
+=======
+>>>>>>> ae07d9a (target fix)
 from iris.sender.quota import (get_application_quotas_query, insert_application_quota_query,
                                required_quota_keys, quota_int_keys)
 
