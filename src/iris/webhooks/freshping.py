@@ -96,7 +96,7 @@ class freshping(object):
                 'active': True,
             }
 
-            session.execute(
+            incident_id = session.execute(
                 '''INSERT INTO `incident` (`plan_id`, `created`, `context`,
                                            `current_step`, `active`, `application_id`)
                    VALUES (:plan_id, :created, :context, 0, :active, :application_id)''',
@@ -106,3 +106,5 @@ class freshping(object):
             session.close()
 
         resp.status = HTTP_201
+        resp.set_header('Location', '/incidents/%s' % incident_id)
+        resp.body = ujson.dumps(incident_id)
