@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 from falcon import HTTPBadRequest
 
 from iris.webhooks.webhook import webhook

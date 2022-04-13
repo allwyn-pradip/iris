@@ -3,7 +3,6 @@
 
 from . import db
 import logging
-import gevent.lock
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +12,6 @@ target_types = {}  # name -> id
 target_roles = {}  # name -> id
 modes = {}         # name -> id
 slack_ids = {}     # name -> id
-api_cache_lock = gevent.lock.BoundedSemaphore(1)
 
 
 def cache_applications():
@@ -48,8 +46,7 @@ def cache_applications():
                           WHERE `application_id` = %s''', app['id'])
         app['categories'] = {row['name']: row for row in cursor}
         new_applications[app['name']] = app
-    with api_cache_lock:
-        applications = new_applications
+    applications = new_applications
     connection.close()
     cursor.close()
     logger.debug('Loaded applications: %s', ', '.join(applications))
@@ -61,8 +58,7 @@ def cache_priorities():
     cursor = connection.cursor(db.dict_cursor)
     cursor.execute('''SELECT `priority`.`id`, `priority`.`name`, `priority`.`mode_id`
                       FROM `priority`''')
-    with api_cache_lock:
-        priorities = {row['name']: row for row in cursor}
+    priorities = {row['name']: row for row in cursor}
     cursor.close()
     connection.close()
 
@@ -72,8 +68,7 @@ def cache_target_types():
     connection = db.engine.raw_connection()
     cursor = connection.cursor()
     cursor.execute('''SELECT `name`, `id` FROM target_type''')
-    with api_cache_lock:
-        target_types = dict(cursor)
+    target_types = dict(cursor)
     cursor.close()
     connection.close()
 
@@ -83,8 +78,7 @@ def cache_target_roles():
     connection = db.engine.raw_connection()
     cursor = connection.cursor()
     cursor.execute('''SELECT `name`, `id` FROM target_role''')
-    with api_cache_lock:
-        target_roles = dict(cursor)
+    target_roles = dict(cursor)
     cursor.close()
     connection.close()
 
@@ -94,8 +88,7 @@ def cache_modes():
     connection = db.engine.raw_connection()
     cursor = connection.cursor()
     cursor.execute('''SELECT `name`, `id` FROM mode''')
-    with api_cache_lock:
-        modes = dict(cursor)
+    modes = dict(cursor)
     cursor.close()
     connection.close()
 
@@ -103,8 +96,7 @@ def cache_modes():
 def add_slack_id(username, slack_id):
     global slack_ids
     # slack ids shouldn't change so we don't have to worry about refreshing them
-    with api_cache_lock:
-        slack_ids[username] = slack_id
+    slack_ids[username] = slack_id
 
 
 def init():
