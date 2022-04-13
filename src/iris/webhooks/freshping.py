@@ -98,8 +98,8 @@ class freshping(object):
 
             incident_id = session.execute(
                 '''INSERT INTO `incident` (`plan_id`, `created`, `context`,
-                                           `current_step`, `active`, `application_id`)
-                   VALUES (:plan_id, :created, :context, 0, :active, :application_id)''',
+                                           `current_step`, `active`, `application_id`, `bucket_id`)
+                   VALUES (:plan_id, :created, :context, 0, :active, :application_id, :bucket_id)''',
                 data).lastrowid
 
             session.commit()
