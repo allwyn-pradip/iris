@@ -6,6 +6,7 @@ import re
 from falcon import HTTP_201, HTTPBadRequest, HTTPInvalidParam
 
 from iris import db
+from iris import utils
 
 logger = logging.getLogger(__name__)
 
