@@ -4531,6 +4531,197 @@ class ResponseSlack(ResponseMixin):
             resp.body = ujson.dumps({'app_response': response})
 
 
+def handle_response_external(self, response, mode, source):
+
+    target_name = utils.lookup_username_from_contact(mode, source)
+    if not target_name:
+        logger.error('Failed resolving %s:%s to target name', mode, source)
+        return ('Failed resolving %s:%s to target name', mode, source)
+    external_sender_client = client.IrisClient(self.external_sender_address, self.external_sender_version, self.external_sender_app, self.external_sender_key)
+    claim_all = False
+    claim_last = False
+    if response.lower().startswith('f'):
+        return 'Sincerest apologies'
+    # One-letter shortcuts for claim all/last
+    elif response.lower() == 'a' or 'all' in response.lower():
+        claim_all = True
+    elif response.lower() == 'l' or 'last' in response.lower():
+        claim_last = True
+
+    incident_id = ""
+    # Skip message splitting for single-letter responses
+    if not (claim_all or claim_last):
+        halves = response.split(' ', 1)
+        if len(halves) != 2:
+            return 'could not resolve action'
+        if halves[0].lower() == 'claim' and halves[1].isdigit():
+            incident_id = halves[1]
+        elif halves[1].lower() == 'claim' and halves[0].isdigit():
+            incident_id = halves[0]
+
+        active_incidents = utils.get__active_incidents_from_incident_id_list([incident_id])
+        if len(active_incidents) == 0:
+            return 'Incident with ID: %s is not currently an active incident' % incident_id
+        # get incident id from external sender and claim it
+        if incident_id != "":
+            utils.claim_incident(incident_id, target_name)
+            return 'claimed: %s' % incident_id
+
+    if claim_last:
+        last_day_date_time = datetime.datetime.now() - datetime.timedelta(hours=24)
+        date_timestamp = int((time.mktime(last_day_date_time.timetuple())))
+        r = external_sender_client.get('messages?incident_id__ne=0&active=1&target=%s&created__ge=%d' % (target_name, date_timestamp), verify=self.verify)
+        if r.ok:
+            messages = r.json()
+            incident_ids = []
+            for message in messages:
+                incident_ids.append(message.get('incident_id', ''))
+            if len(incident_ids) == 0:
+                return 'found no active incidents to claim at this time'
+            active_incidents = utils.get__active_incidents_from_incident_id_list(incident_ids)
+            if len(active_incidents) == 0:
+                return 'found no active incidents to claim at this time'
+            utils.claim_incident(max(active_incidents), target_name)
+            return 'claimed: %s' % max(active_incidents)
+        else:
+            logger.error("failed retrieving messages from external sender: %s", r.text)
+            return 'could not resolve action'
+
+    elif claim_all:
+        last_day_date_time = datetime.datetime.now() - datetime.timedelta(hours=24)
+        date_timestamp = int((time.mktime(last_day_date_time.timetuple())))
+        r = external_sender_client.get('messages?incident_id__ne=0&active=1&target=%s&created__ge=%d' % (target_name, date_timestamp), verify=self.verify)
+        if r.ok:
+            messages = r.json()
+            incident_ids = []
+            for message in messages:
+                incident_ids.append(message.get('incident_id', ''))
+            if len(incident_ids) == 0:
+                return 'found no active incidents to claim at this time'
+            active_incidents = utils.get__active_incidents_from_incident_id_list(incident_ids)
+            if len(active_incidents) == 0:
+                return 'found no active incidents to claim at this time'
+            utils.claim_bulk_incidents(active_incidents, target_name)
+            return 'claimed: %s' % active_incidents
+        else:
+            logger.error("failed retrieving messages from external sender: %s", r.text)
+            return 'could not resolve action'
+
+    return 'could not resolve action'
+
+
+class ResponseTwilioMessageExternal(object):
+    allow_read_no_auth = False
+
+    def __init__(self, config, mode):
+        external_sender_configs = config.get('external_sender', {})
+        self.external_sender_address = external_sender_configs.get('external_sender_address')
+        self.external_sender_app = external_sender_configs.get('external_sender_app')
+        self.external_sender_key = external_sender_configs.get('external_sender_key')
+        self.external_sender_version = external_sender_configs.get('external_sender_version')
+        self.verify = external_sender_configs.get('ca_bundle_path', False)
+        self.mode = mode
+
+    def on_post(self, req, resp):
+        post_dict = parse_qs(req.context['body'])
+        if b'Body' not in post_dict:
+            raise HTTPBadRequest('SMS body not found', 'Missing Body argument in post body')
+
+        if b'From' not in post_dict:
+            raise HTTPBadRequest('From argument not found', 'Missing From in post body')
+        source = post_dict[b'From'][0].decode('utf-8')
+        body = post_dict[b'Body'][0].decode('utf-8')
+
+        response = handle_response_external(self, body.strip(), self.mode, source)
+        resp.status = HTTP_200
+        resp.body = ujson.dumps({'app_response': response})
+
+
+class ResponseTwilioCallExternal(object):
+    allow_read_no_auth = False
+
+    def __init__(self, config, mode):
+        external_sender_configs = config.get('external_sender', {})
+        self.external_sender_address = external_sender_configs.get('external_sender_address')
+        self.external_sender_app = external_sender_configs.get('external_sender_app')
+        self.external_sender_key = external_sender_configs.get('external_sender_key')
+        self.external_sender_version = external_sender_configs.get('external_sender_version')
+        self.verify = external_sender_configs.get('ca_bundle_path', False)
+        self.mode = mode
+
+    def on_post(self, req, resp):
+
+        incident_id = req.get_param('incident_id', required=True)
+        target = req.get_param('target', required=True)
+        if incident_id is None or target is None:
+            raise HTTPBadRequest('Missing incident_id or target')
+        utils.claim_incident(incident_id, target)
+        response = 'claimed %s' % incident_id
+        resp.status = HTTP_200
+        resp.body = ujson.dumps({'app_response': response})
+
+
+class ResponseSlackExternal(object):
+    allow_read_no_auth = False
+
+    def __init__(self, config, mode):
+        external_sender_configs = config.get('external_sender', {})
+        self.external_sender_address = external_sender_configs.get('external_sender_address')
+        self.external_sender_app = external_sender_configs.get('external_sender_app')
+        self.external_sender_key = external_sender_configs.get('external_sender_key')
+        self.external_sender_version = external_sender_configs.get('external_sender_version')
+        self.verify = external_sender_configs.get('ca_bundle_path', False)
+        self.mode = mode
+
+    def on_post(self, req, resp):
+        slack_params = ujson.loads(req.context['body'])
+        try:
+            incident_id = int(slack_params['callback_id'])
+            source = slack_params['source']
+            content = slack_params['content']
+        except KeyError:
+            raise HTTPBadRequest('Post body missing required key')
+
+        if content == 'claim all':
+            response = handle_response_external(self, content, self.mode, source)
+            resp.status = HTTP_200
+            resp.body = ujson.dumps({'app_response': response})
+            return
+        target = utils.lookup_username_from_contact(self.mode, source)
+        if not target:
+            logger.error('Failed resolving %s:%s to target name', self.mode, source)
+            return ('Failed resolving %s:%s to target name', self.mode, source)
+        if incident_id is None or target is None:
+            raise HTTPBadRequest('Missing incident_id or target')
+        utils.claim_incident(incident_id, target)
+        response = 'claimed %s' % incident_id
+        resp.status = HTTP_200
+        resp.body = ujson.dumps({'app_response': response})
+
+
+class ResponseEmailExternal(object):
+    allow_read_no_auth = False
+
+    def __init__(self, config, mode):
+        external_sender_configs = config.get('external_sender', {})
+        self.external_sender_address = external_sender_configs.get('external_sender_address')
+        self.external_sender_app = external_sender_configs.get('external_sender_app')
+        self.external_sender_key = external_sender_configs.get('external_sender_key')
+        self.external_sender_version = external_sender_configs.get('external_sender_version')
+        self.verify = external_sender_configs.get('ca_bundle_path', False)
+        self.mode = mode
+
+    def on_post(self, req, resp):
+        first_line, subject, source, header = process_email_response(req)
+        resp.set_header('X-IRIS-INCIDENT', header)
+        if source is None:
+            resp.status = HTTP_204
+            return
+        response = handle_response_external(self, first_line, self.mode, source)
+        resp.status = HTTP_200
+        resp.body = ujson.dumps({'app_response': response})
+
+
 class TwilioDeliveryUpdate(object):
     allow_read_no_auth = False
 
