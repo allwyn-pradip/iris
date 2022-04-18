@@ -75,7 +75,7 @@ if pidfile:
 
 
 def normalize_phone_number(num):
-    return format_number(parse(num, 'US'),
+    return format_number(parse(num, 'IN'),
                          PhoneNumberFormat.INTERNATIONAL)
 
 
