@@ -694,6 +694,31 @@ CREATE TABLE `twilio_retry` (
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1;
 
 --
+-- Table structure for table `plivo_delivery_status`
+--
+
+DROP TABLE IF EXISTS `plivo_delivery_status`;
+CREATE TABLE `plivo_delivery_status` (
+  `plivo_sid` varchar(34) NOT NULL,
+  `message_id` bigint(20) DEFAULT NULL,
+  `status` varchar(30) DEFAULT NULL,
+  PRIMARY KEY (`plivo_sid`),
+  KEY `plivo_delivery_status_message_id_fk_idx` (`message_id`),
+  CONSTRAINT `plivo_delivery_status_message_id_ibfk` FOREIGN KEY (`message_id`) REFERENCES `message` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=latin1;
+
+
+DROP TABLE IF EXISTS `plivo_retry`;
+CREATE TABLE `plivo_retry` (
+  `message_id` bigint(20) NOT NULL,
+  `retry_id` bigint(20) NOT NULL,
+  PRIMARY KEY (`message_id`),
+  KEY `plivo_retry_retry_id_fk_idx` (`retry_id`),
+  CONSTRAINT `plivo_retry_message_id_ibfk` FOREIGN KEY (`message_id`) REFERENCES `message` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT `plivo_retry_retry_id_ibfk` FOREIGN KEY (`message_id`) REFERENCES `message` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=latin1;
+
+--
 -- Table structure for table `incident_emails`
 --
 

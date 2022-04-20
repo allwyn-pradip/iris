@@ -1519,7 +1519,6 @@ class Incidents(object):
         - application: Application that created this incident (string)
         - plan: Escalation plan name (string)
         - plan_id: Escalation plan id (int)
-        - claimed: Claimed status (bool)
 
         This endpoint also allows specification of a limit via another query parameter, which limits
         results to the N most recent incidents. Calls to this endpoint that do not specify either a limit
@@ -1545,49 +1544,13 @@ class Incidents(object):
         connection = db.engine.raw_connection()
         where = gen_where_filter_clause(connection, incident_filters, incident_filter_types, req.params)
         sql_values = []
-        claimed_filter = req.get_param_as_bool('claimed')
-        if claimed_filter is not None:
-            if claimed_filter:
-                where.append('''`incident`.`owner_id` IS NOT NULL''')
-            else:
-                where.append('''`incident`.`owner_id` IS NULL''')
-
-        if target and not self.external_sender_incident_processing:
+        if target:
             where.append('''`message`.`target_id` IN
                 (SELECT `id`
                 FROM `target`
                 WHERE `target`.`name` IN %s
             )''')
             sql_values.append(tuple(target))
-        if self.external_sender_incident_processing and target:
-            message_query_string = 'messages?limit=500'
-            if req.params.get('created__ge'):
-                message_query_string += '&sent__ge=' + str(req.params.get('created__ge'))
-            if req.params.get('created__le'):
-                message_query_string += '&sent__le=' + str(req.params.get('created__le'))
-            for t in target:
-                message_query_string = message_query_string + '&target=' + str(t)
-            # get messages for incident
-            try:
-                external_sender_client = client.IrisClient(self.external_sender_address, self.external_sender_version, self.external_sender_app, self.external_sender_key)
-                r = external_sender_client.get(message_query_string, verify=self.verify)
-                if r.ok:
-                    incident_IDs = []
-                    messages = r.json()
-                    if len(messages) > 0:
-                        for message in messages:
-                            incident_IDs.append(message.get('incident_id'))
-                        where.append('''`incident`.`id` IN %s''')
-                        sql_values.append(tuple(incident_IDs))
-                    elif target:
-                        # if target field is specified and there are no matching messages that means there are no incidents that match the query
-                        resp.status = HTTP_200
-                        resp.body = ujson.dumps([])
-                        return
-                else:
-                    logger.error('failed retrieving messages from external sender %s', r.text)
-            except Exception as e:
-                logger.exception('failed to establish connection with iris message processor')
         if not (where or query_limit):
             raise HTTPBadRequest('Incident query too broad, add filter or limit')
         if where:
@@ -4509,6 +4472,28 @@ class ResponseGmailOneClick(ResponseMixin):
             raise HTTPBadRequest('Failed to send user response email', re)
         resp.status = HTTP_204
 
+class ResponsePlivoCalls(ResponseMixin):
+    def on_post(self, req, resp):
+        post_dict = parse_qs(req.context['body'])
+
+        msg_id = req.get_param('message_id', required=True)
+        if b'Digits' not in post_dict:
+            raise HTTPBadRequest('Digits argument not found')
+        # For phone call callbacks, To argument is the target and From is the
+        # twilio number
+        if b'To' not in post_dict:
+            raise HTTPBadRequest('To argument not found')
+        digits = post_dict[b'Digits'][0].decode('utf-8')
+        source = post_dict[b'To'][0].decode('utf-8')
+
+        try:
+            _, response = self.handle_user_response('plivocall', msg_id, source, digits)
+        except Exception:
+            logger.exception('Failed to handle plivo call response: %s' % digits)
+            raise
+        else:
+            resp.status = HTTP_200
+            resp.body = ujson.dumps({'app_response': response})
 
 class ResponseTwilioCalls(ResponseMixin):
     def on_post(self, req, resp):
@@ -4527,7 +4512,7 @@ class ResponseTwilioCalls(ResponseMixin):
         try:
             _, response = self.handle_user_response('call', msg_id, source, digits)
         except Exception:
-            logger.exception('Failed to handle call response: %s' % digits)
+            logger.exception('Failed to handle twilio call response: %s' % digits)
             raise
         else:
             resp.status = HTTP_200
@@ -4687,6 +4672,28 @@ class ResponseTwilioMessageExternal(object):
         resp.status = HTTP_200
         resp.body = ujson.dumps({'app_response': response})
 
+class ResponsePlivoCallExternal(object):
+    allow_read_no_auth = False
+
+    def __init__(self, config, mode):
+        external_sender_configs = config.get('external_sender', {})
+        self.external_sender_address = external_sender_configs.get('external_sender_address')
+        self.external_sender_app = external_sender_configs.get('external_sender_app')
+        self.external_sender_key = external_sender_configs.get('external_sender_key')
+        self.external_sender_version = external_sender_configs.get('external_sender_version')
+        self.verify = external_sender_configs.get('ca_bundle_path', False)
+        self.mode = mode
+
+    def on_post(self, req, resp):
+
+        incident_id = req.get_param('incident_id', required=True)
+        target = req.get_param('target', required=True)
+        if incident_id is None or target is None:
+            raise HTTPBadRequest('Missing incident_id or target')
+        utils.claim_incident(incident_id, target)
+        response = 'claimed %s' % incident_id
+        resp.status = HTTP_200
+        resp.body = ujson.dumps({'app_response': response})
 
 class ResponseTwilioCallExternal(object):
     allow_read_no_auth = False
@@ -4771,6 +4778,83 @@ class ResponseEmailExternal(object):
         response = handle_response_external(self, first_line, self.mode, source)
         resp.status = HTTP_200
         resp.body = ujson.dumps({'app_response': response})
+
+
+class PlivoDeliveryUpdate(object):
+    allow_read_no_auth = False
+
+    def on_post(self, req, resp):
+        post_dict = falcon.uri.parse_query_string(req.context['body'].decode('utf-8'))
+
+        sid = post_dict.get('MessageSid', post_dict.get('CallSid'))
+        status = post_dict.get('MessageStatus', post_dict.get('CallStatus'))
+
+        if not sid or not status:
+            logger.exception('Invalid Plivo delivery update request. Payload: %s', post_dict)
+            raise HTTPBadRequest('Invalid keys in payload')
+
+        affected = False
+        connection = db.engine.raw_connection()
+        cursor = connection.cursor()
+        try:
+            max_retries = 3
+            for i in range(max_retries):
+                try:
+                    affected = cursor.execute(
+                        '''UPDATE `plivo_delivery_status`
+                           SET `status` = %(status)s
+                           WHERE `plivo_sid` = %(sid)s''',
+                        {'sid': api_id, 'status': message})
+                    connection.commit()
+                    break
+                except Exception:
+                    logger.exception('Failed running Plivo status query. (Try %s/%s)', i + 1, max_retries)
+                    sleep(.2)
+
+            if status == 'failed':
+                cursor.execute(
+                    '''SELECT message_id
+                       FROM `plivo_delivery_status`
+                       WHERE `plivo_sid` = %(sid)s''',
+                    {'sid': api_id})
+                msg_id = cursor.fetchone()
+                if msg_id is None:
+                    raise HTTPBadRequest('No message id found for SID')
+                msg_id = msg_id[0]
+                cursor.execute(
+                    '''SELECT EXISTS(SELECT 1 FROM `plivo_retry`
+                                     WHERE `retry_id` = %(msg_id)s)''', {'msg_id': msg_id})
+                is_retry = cursor.fetchone()[0]
+                # Don't retry messages that are already a retry
+                if not is_retry:
+                    cursor.execute(
+                        '''INSERT INTO `message` (`created`, `incident_id`, `application_id`,
+                                                  `target_id`, `priority_id`, `body`)
+                           SELECT NOW(), `incident_id`, `application_id`, `target_id`, `priority_id`, `body`
+                           FROM `message` WHERE `id` = %(msg_id)s
+                        ''',
+                        {'msg_id': msg_id}
+                    )
+                    retry_id = cursor.lastrowid
+                    cursor.execute(
+                        '''INSERT INTO `plivo_retry` (`message_id`, `retry_id`)
+                           VALUES (%(msg_id)s, %(retry_id)s)
+                        ''',
+                        {'msg_id': msg_id, 'retry_id': retry_id})
+                    connection.commit()
+            cursor.close()
+        except Exception:
+            msg = 'Failed to update Plivo delivery status'
+            logger.exception(msg)
+            raise HTTPBadRequest(msg, msg)
+        finally:
+            cursor.close()
+            connection.close()
+
+        if not affected:
+            logger.warning('No rows changed when updating delivery status for Plivo sid: %s', sid)
+
+        resp.status = HTTP_204
 
 
 class TwilioDeliveryUpdate(object):
@@ -6353,10 +6437,12 @@ def construct_falcon_api(debug, healthcheck_path, allowed_origins, iris_sender_a
     api.add_route('/v0/response/gmail', ResponseEmail(iris_sender_app))
     api.add_route('/v0/response/email', ResponseEmail(iris_sender_app))
     api.add_route('/v0/response/gmail-oneclick', ResponseGmailOneClick(iris_sender_app))
+    api.add_route('/v0/response/plivo/calls', ResponsePlivoCalls(iris_sender_app))
     api.add_route('/v0/response/twilio/calls', ResponseTwilioCalls(iris_sender_app))
     api.add_route('/v0/response/twilio/messages', ResponseTwilioMessages(iris_sender_app))
     api.add_route('/v0/response/slack', ResponseSlack(iris_sender_app))
     api.add_route('/v0/twilio/deliveryupdate', TwilioDeliveryUpdate())
+    api.add_route('/v0/plivo/deliveryupdate', PlivoDeliveryUpdate())
 
     api.add_route('/v0/categories', NotificationCategories())
     api.add_route('/v0/categories/{application}', NotificationCategories())

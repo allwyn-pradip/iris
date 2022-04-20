@@ -38,7 +38,7 @@ class IrisPlugin(object):
             return ''
 
     def handle_response(self, mode, msg_id, source, content, batch=False):
-        if mode == 'call':
+        if mode == 'call' or mode == 'plivocall':
             digits = content
             logger.info('%s Plugin got phone call response for message(%s): %s:',
                         self.name, msg_id, digits)
