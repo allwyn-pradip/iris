@@ -85,7 +85,7 @@ class iris_plivo(object):
 
         result = sender(to_=message['destination'],
                         from_=from_,
-                        answer_url=relay_cb_url
+                        answer_url=relay_cb_url,
                         status_callback=status_callback_url)
 
         send_time = time.time() - start
