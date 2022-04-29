@@ -4753,6 +4753,21 @@ class TwilioDeliveryUpdate(object):
             raise HTTPBadRequest('Invalid keys in payload')
 
         affected = False
+        # if external sender is enabled send an api to update it there instead
+        if self.external_sender_incident_processing:
+            payload = {
+                'status': status,
+                'vendor_identifier': sid
+            }
+            external_sender_client = client.IrisClient(self.external_sender_address, self.external_sender_version, self.external_sender_app, self.external_sender_key)
+            r = external_sender_client.post('message_status', json=payload, verify=self.verify)
+            if r.ok:
+                resp.status = HTTP_204
+                return
+            logger.error("failed updating message status via external sender: %s", r.text)
+            resp.status = str(r.status_code)
+            return
+
         connection = db.engine.raw_connection()
         cursor = connection.cursor()
         try:
