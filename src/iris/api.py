@@ -6101,6 +6101,7 @@ class SenderHeartbeat():
 
     def on_get(self, req, resp, node_id):
         payload = {}
+        sender_hostname = req.get_param('fqdn', default=req.remote_addr)
 
         # configure sql client
         connection = db.engine.raw_connection()
@@ -6127,7 +6128,7 @@ class SenderHeartbeat():
 
                 # node was not previously a member of this cluster so figure out what nodes to assign to itself
                 cursor.execute(
-                    "INSERT INTO IMP_cluster_members VALUES(%s, %s, NOW())", (node_id, req.remote_addr))
+                    "INSERT INTO IMP_cluster_members VALUES(%s, %s, NOW())", (node_id, sender_hostname))
 
                 # node is the first node in the cluster, directly assign all buckets to it
                 if len(cluster_members) == 0:
@@ -6198,7 +6199,7 @@ class SenderHeartbeat():
             else:
                 # update last modified time to renew our TTL
                 cursor.execute(
-                    "UPDATE IMP_cluster_members SET last_modified = NOW() WHERE node_id = %s", node_id)
+                    "UPDATE IMP_cluster_members SET last_modified = NOW(), hostname = %s WHERE node_id = %s", (sender_hostname, node_id))
 
             # check if there are any buckets that belong to this node that we have to give up
 
