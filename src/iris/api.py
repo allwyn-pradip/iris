@@ -28,11 +28,7 @@ import falcon
 from collections import defaultdict
 from streql import equals
 
-from . import db
-from . import utils
-from . import cache
-from . import ui
-from . import app_stats
+from . import app_stats, cache, client, db, ui, utils
 from .config import load_config
 from iris.vendors.iris_slack import iris_slack
 from iris.sender import auditlog
