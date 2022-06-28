@@ -37,7 +37,7 @@ setuptools.setup(
         'PyYAML',
         'greenlet==1.1.2',
         'gevent==21.12.0',
-        'falcon==1.4.1',
+        'falcon',
         'falcon-cors',
         'ujson==1.35',
         'requests',

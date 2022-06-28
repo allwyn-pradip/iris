@@ -138,7 +138,7 @@ class StaticResource(object):
         filepath = os.path.join(ui_root, self.path, secure_filename(filename))
         try:
             resp.stream = open(filepath, 'rb')
-            resp.stream_len = os.path.getsize(filepath)
+            resp.content_length = os.path.getsize(filepath)
         except IOError:
             raise HTTPNotFound()
 
