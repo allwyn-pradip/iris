@@ -6508,7 +6508,7 @@ def get_api(config):
     supported_timezones = config.get('supported_timezones', [])
 
     # all notifications go through leader sender for now
-    app = falcon.api(
+    app = construct_falcon_api(
         debug, healthcheck_path, allowed_origins, iris_sender_app, zk_hosts, default_leader_sender_addr, supported_timezones, config)
 
     # Need to call this after all routes have been created
