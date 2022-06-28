@@ -29,7 +29,7 @@ def generate_bucket_id():
 
 
 def normalize_phone_number(num):
-    return pn_format_number(pn_parse(num, 'US'),
+    return pn_format_number(pn_parse(num, 'IND'),
                             PhoneNumberFormat.INTERNATIONAL)
 
 
