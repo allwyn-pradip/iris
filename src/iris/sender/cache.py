@@ -424,7 +424,8 @@ class TargetReprioritization(object):
         except KeyError:
             # target has no reprioritization rules defined
             # leave existing mode
-            return
+            return message
+        return message
 
 
 class RoleTargets():
