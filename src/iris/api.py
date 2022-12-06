@@ -22,8 +22,6 @@ from falcon import (HTTP_200, HTTP_201, HTTP_204, HTTP_503, HTTPBadRequest,
                     HTTPInternalServerError, API)
 from falcon_cors import CORS
 from sqlalchemy.exc import IntegrityError, InternalError, OperationalError
-import falcon.uri
-import falcon
 
 from collections import defaultdict
 from streql import equals
@@ -624,7 +622,7 @@ get_application_custom_sender_addresses = '''SELECT `mode`.`name` AS mode_name, 
                                   WHERE `application_custom_sender_address`.`application_id` = %s'''
 
 
-uuid4hex = re.compile('[0-9a-f]{32}\Z', re.I)
+uuid4hex = re.compile(r'[0-9a-f]{32}\Z', re.I)
 
 
 def stream_incidents_with_context(cursor, title=False):
@@ -758,12 +756,12 @@ class ReqBodyMiddleware(object):
     problem, we read the post body into the request context and access it from
     there.
 
-    IMPORTANT NOTE: Because we use stream.read() here, all other uses of this
+    IMPORTANT NOTE: Because we use bounded_stream.read() here, all other uses of this
     method will return '', not the post body.
     '''
 
     def process_request(self, req, resp):
-        req.context['body'] = req.stream.read()
+        req.context['body'] = req.bounded_stream.read()
 
 
 class AuthMiddleware(object):
@@ -835,7 +833,7 @@ class AuthMiddleware(object):
 
             # determine if we're correctly using an application key
             api_key = req.get_param('key', required=True)
-            if not equals(api_key, str(app['key'])) or equals(api_key, str(app['secondary_key'])):
+            if not hmac.compare_digest(api_key, str(app['key'])) or hmac.compare_digest(api_key, str(app['secondary_key'])):
                 logger.warning('Application key invalid')
                 raise HTTPUnauthorized('Authentication failure', '', [])
             return
@@ -890,7 +888,7 @@ class AuthMiddleware(object):
                             text = '%s %s %s %s' % (window, method, path, body)
                         HMAC = hmac.new(api_key.encode('utf-8'), text.encode('utf-8'), hashlib.sha512)
                         digest = base64.urlsafe_b64encode(HMAC.digest())
-                        if equals(client_digest.encode('utf-8'), digest):
+                        if hmac.compare_digest(client_digest.encode('utf-8'), digest):
                             req.context['app'] = app
                             if username_header:
                                 req.context['username'] = username_header
@@ -964,7 +962,7 @@ class ACLMiddleware(object):
 
         if enforce_user and not req.context['is_admin']:
             path_username = params.get('username')
-            if not equals(path_username, req.context['username']):
+            if not path_username == req.context['username']:
                 raise HTTPUnauthorized('This user is not allowed to access this resource', '', [])
 
     def load_user_settings(self, req):
