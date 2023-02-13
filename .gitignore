@@ -15,3 +15,4 @@ venv
 /src/iris/ui/static/images/iris-mobile-qr.svg
 .tox
 *.orig
+.vscode
