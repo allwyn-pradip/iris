@@ -18,7 +18,7 @@ from random import randrange
 logger = logging.getLogger(__name__)
 
 BUCKET_ID_MAX = 100
-uuid4hex = re.compile('[0-9a-f]{32}\Z', re.I)
+uuid4hex = re.compile(r'[0-9a-f]{32}\Z', re.I)
 allowed_text_response_actions = frozenset(['suppress', 'claim'])
 
 
@@ -43,9 +43,9 @@ def parse_response(response, mode, source):
     if response.lower().startswith('f'):
         return None, 'Sincerest apologies'
     # One-letter shortcuts for claim all/last
-    elif re.match('^a\s*$', response, re.IGNORECASE):
+    elif re.match(r'^a\s*$', response, re.IGNORECASE):
         claim_all = True
-    elif re.match('^l\s*$', response, re.IGNORECASE):
+    elif re.match(r'^l\s*$', response, re.IGNORECASE):
         claim_last = True
 
     # Skip message splitting for single-letter responses
@@ -69,7 +69,7 @@ def parse_response(response, mode, source):
         if validate_msg_id(msg_id) and (cmd in allowed_text_response_actions):
             return msg_id, ' '.join([cmd] + args)
 
-    if claim_last or re.match('claim\s+last', response, re.IGNORECASE):
+    if claim_last or re.match(r'claim\s+last', response, re.IGNORECASE):
         target_name = lookup_username_from_contact(mode, source)
         if not target_name:
             logger.error('Failed resolving %s:%s to target name', mode, source)
@@ -91,7 +91,7 @@ def parse_response(response, mode, source):
         msg_id = ret[0] if ret else None
         return msg_id, 'claim'
 
-    elif claim_all or re.match('claim\s+all', response, re.IGNORECASE):
+    elif claim_all or re.match(r'claim\s+all', response, re.IGNORECASE):
         target_name = lookup_username_from_contact(mode, source)
         if not target_name:
             logger.error('Failed resolving %s:%s to target name', mode, source)
@@ -139,6 +139,17 @@ def get_incident_ids_from_message_ids(msg_ids):
     connection = db.engine.raw_connection()
     cursor = connection.cursor()
     cursor.execute(sql, (tuple(msg_ids), ))
+    ret = [row[0] for row in cursor]
+    cursor.close()
+    connection.close()
+    return ret
+
+
+def get__active_incidents_from_incident_id_list(incident_ids):
+    sql = 'SELECT `incident`.`id` FROM `incident` WHERE `incident`.`active` = 1 AND `incident`.`id` IN %s'
+    connection = db.engine.raw_connection()
+    cursor = connection.cursor()
+    cursor.execute(sql, (tuple(incident_ids), ))
     ret = [row[0] for row in cursor]
     cursor.close()
     connection.close()

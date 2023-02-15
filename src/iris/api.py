@@ -1,62 +1,53 @@
 # Copyright (c) LinkedIn Corporation. All rights reserved. Licensed under the BSD-2 Clause license.
 # See LICENSE in the project root for license information.
-from gevent import spawn, sleep, socket, Timeout
-
-import msgpack
-import time
-import hmac
-import hashlib
 import base64
-import re
+import datetime
+import hashlib
+import hmac
+import logging
+import math
 import os
 import random
-import datetime
-import logging
-import importlib
-import jinja2
+import re
+import time
 import uuid
-import math
-from jinja2.sandbox import SandboxedEnvironment
-from contextlib import ExitStack
-from kazoo.client import KazooClient
-from urllib.parse import parse_qs
-import ujson
-from falcon import (HTTP_200, HTTP_201, HTTP_204, HTTP_503, HTTPBadRequest,
-                    HTTPNotFound, HTTPUnauthorized, HTTPForbidden, HTTPFound,
-                    HTTPInternalServerError, API)
-from falcon_cors import CORS
-from sqlalchemy.exc import IntegrityError, InternalError, OperationalError
-import falcon.uri
-import falcon
-
 from collections import defaultdict
-from streql import equals
+from contextlib import ExitStack
+from urllib.parse import parse_qs
 
-from . import db
-from . import utils
-from . import cache
-from . import ui
-from . import app_stats
-from . import client
-from .role_lookup import get_role_lookups
-from .config import load_config
-from iris.vendors.iris_slack import iris_slack
-from iris.role_lookup import IrisRoleLookupException
-from iris.sender import auditlog
-from iris.bin import sender
-from iris.utils import sanitize_unicode_dict
-from iris.sender.quota import (get_application_quotas_query, insert_application_quota_query,
-                               required_quota_keys, quota_int_keys)
+import falcon
+import falcon.uri
+import jinja2
+import msgpack
+import ujson
+from falcon import (API, HTTP_200, HTTP_201, HTTP_204, HTTP_503,
+                    HTTPBadRequest, HTTPForbidden, HTTPFound,
+                    HTTPInternalServerError, HTTPNotFound, HTTPUnauthorized)
+from falcon_cors import CORS
+from gevent import Timeout, sleep, socket, spawn
+from jinja2.sandbox import SandboxedEnvironment
+from kazoo.client import KazooClient
+from sqlalchemy.exc import IntegrityError, InternalError, OperationalError
 
+from iris.bin.sender import render, set_target_contact
 from iris.custom_import import import_custom_module
 from iris.custom_incident_handler import CustomIncidentHandlerDispatcher
+from iris.role_lookup import IrisRoleLookupException
+from iris.sender import auditlog
+from iris.sender.quota import (get_application_quotas_query,
+                               insert_application_quota_query, quota_int_keys,
+                               required_quota_keys)
+from iris.utils import sanitize_unicode_dict
+from iris.vendors.iris_slack import iris_slack
 
-from .constants import (
-    XFRAME, XCONTENTTYPEOPTIONS, XXSSPROTECTION, PRIORITY_PRECEDENCE_MAP
-)
-
-from .plugins import init_plugins, find_plugin
-from .validators import init_validators, run_validation, IrisValidationException
+from . import app_stats, cache, client, db, ui, utils
+from .config import load_config
+from .constants import (PRIORITY_PRECEDENCE_MAP, XCONTENTTYPEOPTIONS, XFRAME,
+                        XXSSPROTECTION)
+from .plugins import find_plugin, init_plugins
+from .role_lookup import get_role_lookups
+from .validators import (IrisValidationException, init_validators,
+                         run_validation)
 
 logger = logging.getLogger(__name__)
 
@@ -636,7 +627,7 @@ get_application_custom_sender_addresses = '''SELECT `mode`.`name` AS mode_name, 
                                   WHERE `application_custom_sender_address`.`application_id` = %s'''
 
 
-uuid4hex = re.compile('[0-9a-f]{32}\Z', re.I)
+uuid4hex = re.compile(r'[0-9a-f]{32}\Z', re.I)
 
 
 def stream_incidents_with_context(cursor, title=False):
@@ -770,12 +761,12 @@ class ReqBodyMiddleware(object):
     problem, we read the post body into the request context and access it from
     there.
 
-    IMPORTANT NOTE: Because we use stream.read() here, all other uses of this
+    IMPORTANT NOTE: Because we use bounded_stream.read() here, all other uses of this
     method will return '', not the post body.
     '''
 
     def process_request(self, req, resp):
-        req.context['body'] = req.stream.read()
+        req.context['body'] = req.bounded_stream.read()
 
 
 class AuthMiddleware(object):
@@ -847,7 +838,7 @@ class AuthMiddleware(object):
 
             # determine if we're correctly using an application key
             api_key = req.get_param('key', required=True)
-            if not equals(api_key, str(app['key'])) or equals(api_key, str(app['secondary_key'])):
+            if not hmac.compare_digest(api_key, str(app['key'])) or hmac.compare_digest(api_key, str(app['secondary_key'])):
                 logger.warning('Application key invalid')
                 raise HTTPUnauthorized('Authentication failure', '', [])
             return
@@ -902,7 +893,7 @@ class AuthMiddleware(object):
                             text = '%s %s %s %s' % (window, method, path, body)
                         HMAC = hmac.new(api_key.encode('utf-8'), text.encode('utf-8'), hashlib.sha512)
                         digest = base64.urlsafe_b64encode(HMAC.digest())
-                        if equals(client_digest.encode('utf-8'), digest):
+                        if hmac.compare_digest(client_digest.encode('utf-8'), digest):
                             req.context['app'] = app
                             if username_header:
                                 req.context['username'] = username_header
@@ -976,7 +967,7 @@ class ACLMiddleware(object):
 
         if enforce_user and not req.context['is_admin']:
             path_username = params.get('username')
-            if not equals(path_username, req.context['username']):
+            if not path_username == req.context['username']:
                 raise HTTPUnauthorized('This user is not allowed to access this resource', '', [])
 
     def load_user_settings(self, req):
@@ -1360,6 +1351,16 @@ class Plans(object):
         if not acl_allowed(req, plan_params['creator']):
             raise HTTPUnauthorized('Invalid plan creator for authenticated app/user')
 
+        # check aggregation settings (3600 in 60 minutes in seconds)
+        if plan_params.get('threshold_count') > 500:
+            raise HTTPBadRequest('Invalid plan', 'Aggregation trigger threshold count must be less than 500')
+        if plan_params.get('threshold_window') > 3600:
+            raise HTTPBadRequest('Invalid plan', 'Aggregation trigger window must be less than 60 minutes')
+        if plan_params.get('aggregation_window') > 3600:
+            raise HTTPBadRequest('Invalid plan', 'Aggregation duration must be less than 60 minutes')
+        if plan_params.get('aggregation_reset') > 3600:
+            raise HTTPBadRequest('Invalid plan', 'Aggregation reset time must be less than 60 minutes')
+
         tracking_key = plan_params.get('tracking_key')
         tracking_type = plan_params.get('tracking_type')
         tracking_template = plan_params.get('tracking_template')
@@ -1393,6 +1394,12 @@ class Plans(object):
         for steps in plan_params['steps']:
             longest_step = 0
             for step in steps:
+                # check step wait and repeat (43200 is 12 hours in seconds)
+                if step['wait'] > 43200:
+                    raise HTTPBadRequest('Invalid plan', 'Notification wait time must be less than 12 hours')
+                if step['repeat'] > 20:
+                    raise HTTPBadRequest('Invalid plan', 'Notification cannot repeat more than 20 times')
+
                 if 'dynamic_index' in step:
                     dynamic_indices.add(step['dynamic_index'])
                 if (step.get('wait', 0) * step.get('count', 0)) > longest_step:
@@ -1403,6 +1410,7 @@ class Plans(object):
             raise HTTPBadRequest('Invalid plan',
                                  'Dynamic target numbers must span 0..n without gaps')
 
+        # check total plan length (86400 is 24 h in seconds)
         if plan_length > 86400:
             raise HTTPBadRequest('Invalid plan',
                                  'Plan length exceeds the 24 hour maximum')
@@ -1577,7 +1585,7 @@ class Incidents(object):
             )''')
             sql_values.append(tuple(target))
         if self.external_sender_incident_processing and target:
-            message_query_string = 'messages?limit=500'
+            message_query_string = 'messages?limit=1000&incident_id__gt=0'
             if req.params.get('created__ge'):
                 message_query_string += '&sent__ge=' + str(req.params.get('created__ge'))
             if req.params.get('created__le'):
@@ -4776,9 +4784,9 @@ def handle_response_external(self, response, mode, source):
     if response.lower().startswith('f'):
         return 'Sincerest apologies'
     # One-letter shortcuts for claim all/last
-    elif response.lower() == 'a':
+    elif response.lower() == 'a' or 'all' in response.lower():
         claim_all = True
-    elif response.lower() == 'l':
+    elif response.lower() == 'l' or 'last' in response.lower():
         claim_last = True
 
     incident_id = ""
@@ -4792,35 +4800,50 @@ def handle_response_external(self, response, mode, source):
         elif halves[1].lower() == 'claim' and halves[0].isdigit():
             incident_id = halves[0]
 
+        active_incidents = utils.get__active_incidents_from_incident_id_list([incident_id])
+        if len(active_incidents) == 0:
+            return 'Incident with ID: %s is not currently an active incident' % incident_id
         # get incident id from external sender and claim it
         if incident_id != "":
             utils.claim_incident(incident_id, target_name)
             return 'claimed: %s' % incident_id
 
-    if claim_last or response.lower() == 'claim all':
-        r = external_sender_client.get('messages?active=1&limit=1&target=%s' % target_name, verify=self.verify)
+    if claim_last:
+        last_day_date_time = datetime.datetime.now() - datetime.timedelta(hours=24)
+        date_timestamp = int((time.mktime(last_day_date_time.timetuple())))
+        r = external_sender_client.get('messages?incident_id__ne=0&active=1&target=%s&created__ge=%d' % (target_name, date_timestamp), verify=self.verify)
         if r.ok:
             messages = r.json()
             incident_ids = []
             for message in messages:
                 incident_ids.append(message.get('incident_id', ''))
-            utils.claim_bulk_incidents(incident_ids, target_name)
-            return 'claimed: %s' % incident_ids
+            if len(incident_ids) == 0:
+                return 'found no active incidents to claim at this time'
+            active_incidents = utils.get__active_incidents_from_incident_id_list(incident_ids)
+            if len(active_incidents) == 0:
+                return 'found no active incidents to claim at this time'
+            utils.claim_incident(max(active_incidents), target_name)
+            return 'claimed: %s' % max(active_incidents)
         else:
             logger.error("failed retrieving messages from external sender: %s", r.text)
             return 'could not resolve action'
 
-    elif claim_all or response.lower() == 'claim all':
+    elif claim_all:
         last_day_date_time = datetime.datetime.now() - datetime.timedelta(hours=24)
         date_timestamp = int((time.mktime(last_day_date_time.timetuple())))
-        r = external_sender_client.get('messages?active=1&target=%s&created__ge=%d' % (target_name, date_timestamp), verify=self.verify)
+        r = external_sender_client.get('messages?incident_id__ne=0&active=1&target=%s&created__ge=%d' % (target_name, date_timestamp), verify=self.verify)
         if r.ok:
             messages = r.json()
             incident_ids = []
             for message in messages:
                 incident_ids.append(message.get('incident_id', ''))
-            utils.claim_bulk_incidents(incident_ids, target_name)
-            return 'claimed: %s' % incident_ids
+            if len(incident_ids) == 0:
+                return 'found no active incidents to claim at this time'
+            active_incidents = utils.get__active_incidents_from_incident_id_list(incident_ids)
+            if len(active_incidents) == 0:
+                return 'found no active incidents to claim at this time'
+            utils.claim_bulk_incidents(active_incidents, target_name)
+            return 'claimed: %s' % active_incidents
         else:
             logger.error("failed retrieving messages from external sender: %s", r.text)
             return 'could not resolve action'
@@ -4974,7 +4997,7 @@ class TwilioDeliveryUpdate(object):
             external_sender_client = client.IrisClient(self.external_sender_address, self.external_sender_version, self.external_sender_app, self.external_sender_key)
             r = external_sender_client.post('message_status', json=payload, verify=self.verify)
             if r.ok:
-                resp.status = HTTP_200
+                resp.status = HTTP_204
                 return
             logger.error("failed updating message status via external sender: %s", r.text)
             resp.status = str(r.status_code)
@@ -5983,16 +6006,18 @@ class InternalBuildMessages():
             success = False
             try:
                 success, message = set_target_contact(notification)
-            except (ValueError, TypeError):
-                success = False
+            except Exception as e:
+                logger.warning('Failed to build, could not resolve target contacts %s with error: %s' % (ujson.dumps(notification), str(e)))
+                continue
             if not success:
                 logger.warning('Failed to build, could not resolve target contacts %s' % ujson.dumps(notification))
                 continue
             try:
                 message = render(message)
-                messages.append(message)
             except Exception as e:
                 logger.warning('Failed to render message %s with error: %s' % (ujson.dumps(notification), str(e)))
+            # send unrendered message even if we fail to render
+            messages.append(message)
         if len(messages) == 0:
             raise HTTPBadRequest('Failed to build, could not resolve any messages from notification')
 
@@ -6042,8 +6067,19 @@ class InternalBuildMessages():
             # replace the multi-message formatted list with the individual formatted messages list
             messages = split_msgs
 
+        # deduplicate messages with same destination
+        unique_messages = []
+        unique_destinations = defaultdict(set)
+        for message in messages:
+            if message.get("destination") and message.get("mode") not in unique_destinations[message["destination"]]:
+                unique_destinations[message["destination"]].add(message["mode"])
+                unique_messages.append(message)
+            if message.get("bcc_destination") and message.get("mode") not in unique_destinations[message["bcc_destination"]]:
+                unique_destinations[message["bcc_destination"]].add(message["mode"])
+                unique_messages.append(message)
+
         resp.status = HTTP_200
-        resp.body = ujson.dumps(messages)
+        resp.body = ujson.dumps(unique_messages)
 
 
 class InternalApplicationsAuth():
@@ -6163,6 +6199,7 @@ class SenderHeartbeat():
 
     def on_get(self, req, resp, node_id):
         payload = {}
+        sender_hostname = req.get_param('fqdn', default=req.remote_addr)
 
         # configure sql client
         connection = db.engine.raw_connection()
@@ -6189,7 +6226,7 @@ class SenderHeartbeat():
 
                 # node was not previously a member of this cluster so figure out what nodes to assign to itself
                 cursor.execute(
-                    "INSERT INTO IMP_cluster_members VALUES(%s, %s, NOW())", (node_id, req.remote_addr))
+                    "INSERT INTO IMP_cluster_members VALUES(%s, %s, NOW())", (node_id, sender_hostname))
 
                 # node is the first node in the cluster, directly assign all buckets to it
                 if len(cluster_members) == 0:
@@ -6260,7 +6297,7 @@ class SenderHeartbeat():
             else:
                 # update last modified time to renew our TTL
                 cursor.execute(
-                    "UPDATE IMP_cluster_members SET last_modified = NOW() WHERE node_id = %s", node_id)
+                    "UPDATE IMP_cluster_members SET last_modified = NOW(), hostname = %s WHERE node_id = %s", (sender_hostname, node_id))
 
             # check if there are any buckets that belong to this node that we have to give up
 
@@ -6495,6 +6532,9 @@ def construct_falcon_api(debug, healthcheck_path, allowed_origins, iris_sender_a
     external_sender_incident_processing = config.get('external_sender', {}).get('external_sender_incident_processing', False)
 
     api.set_error_serializer(json_error_serializer)
+    api.req_options.strip_url_path_trailing_slash = True
+    # needed to preserve get_param_as_list behavior
+    api.req_options.auto_parse_qs_csv = True
 
     api.add_route('/v0/plans/{plan_id}', Plan())
     api.add_route('/v0/plans', Plans())
@@ -6594,7 +6634,7 @@ def init_webhooks(config, api):
     webhooks = config.get('webhooks', [])
     for webhook in webhooks:
         webhook_class = import_custom_module('iris.webhooks', webhook)
-        api.add_route('/v0/webhooks/' + webhook, webhook_class())
+        api.add_route('/v0/webhooks/' + webhook, webhook_class(config))
 
 
 def get_api(config):

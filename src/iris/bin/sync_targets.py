@@ -236,7 +236,7 @@ def sync_from_oncall(config, engine, purge_old_users=True):
     oncall_add_sql = 'INSERT INTO `oncall_team` (`target_id`, `oncall_team_id`) VALUES (%s, %s)'
     user_add_sql = 'INSERT IGNORE INTO `user` (`target_id`) VALUES (%s)'
     target_contact_add_sql = '''INSERT INTO `target_contact` (`target_id`, `mode_id`, `destination`)
-                                VALUES (%s, %s, %s)
+                                VALUES ((SELECT `id` FROM `target` WHERE `name`=%s AND `type_id`=%s LIMIT 1), %s, %s)
                                 ON DUPLICATE KEY UPDATE `destination` = %s'''
 
     # insert users that need to be
@@ -257,7 +257,7 @@ def sync_from_oncall(config, engine, purge_old_users=True):
             if value and key in modes:
                 logger.info('%s: %s -> %s', username, key, value)
                 try:
-                    engine.execute(target_contact_add_sql, (target_id, modes[key], value, value))
+                    engine.execute(target_contact_add_sql, (username, target_types['user'], modes[key], value, value))
                 except SQLAlchemyError as e:
                     logger.exception('Error adding contact for target id: %s', target_id)
                     metrics.incr('sql_errors')
@@ -343,20 +343,30 @@ def sync_from_oncall(config, engine, purge_old_users=True):
 
         current_name = iris_db_oncall_team_id_name_dict[oncall_id]
         new_name = oncall_response_dict_id_key[oncall_id]
+        target_id_to_rename = iris_target_name_id_dict[current_name]
         try:
             if current_name != new_name:
                 # handle edge case of teams swapping names
                 if not iris_target_name_id_dict.get(new_name, None):
-                    target_id_to_rename = iris_target_name_id_dict[current_name]
                     logger.info('Renaming team %s to %s', current_name, new_name)
                     engine.execute('''UPDATE `target` SET `name` = %s, `active` = TRUE WHERE `id` = %s''', (oncall_case_sensitive_dict[new_name], target_id_to_rename))
                 else:
-                    # there is a team swap so rename to a random name to prevent a violation of unique target name constraint
-                    new_name = str(uuid.uuid4())
-                    target_id_to_rename = iris_target_name_id_dict[current_name]
-                    name_swaps[oncall_id] = target_id_to_rename
-                    logger.info('Renaming team %s to %s', current_name, new_name)
-                    engine.execute('''UPDATE `target` SET `name` = %s, `active` = TRUE WHERE `id` = %s''', (new_name, target_id_to_rename))
+                    squatter_target_id = iris_target_name_id_dict[new_name]
+                    oncall_ids = [oncall_team_id for oncall_team_id in engine.execute('''SELECT `oncall_team_id` FROM `oncall_team` WHERE `target_id`=%s LIMIT 1''', squatter_target_id)]
+                    squatter_oncall_id = oncall_ids[0]
+
+                    # check if team that is squatting on new_name needs to be purged or swap names
+                    if oncall_response_dict_id_key.get(squatter_oncall_id):
+                        # there is a team swap so rename to a random name to prevent a violation of unique target name constraint
+                        new_name = str(uuid.uuid4())
+                        name_swaps[oncall_id] = target_id_to_rename
+                        logger.info('Renaming team %s to %s', current_name, new_name)
+                        engine.execute('''UPDATE `target` SET `name` = %s, `active` = TRUE WHERE `id` = %s''', (new_name, target_id_to_rename))
+                    else:
+                        # prune inactve team and take its name directly
+                        prune_target(engine, new_name, 'team')
+                        logger.info('Renaming team %s to %s', current_name, new_name)
+                        engine.execute('''UPDATE `target` SET `name` = %s, `active` = TRUE WHERE `id` = %s''', (oncall_case_sensitive_dict[new_name], target_id_to_rename))
                 sleep(update_sleep)
         except SQLAlchemyError as e:
             logger.exception('Error changing team name of %s to %s', current_name, new_name)
