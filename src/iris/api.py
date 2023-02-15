@@ -8,41 +8,53 @@ import time
 import hmac
 import hashlib
 import base64
-import re
+import datetime
+import hashlib
+import hmac
+import logging
+import math
 import os
 import random
-import datetime
-import logging
-import jinja2
-from jinja2.sandbox import SandboxedEnvironment
+import re
+import time
+import uuid
+from collections import defaultdict
+from contextlib import ExitStack
 from urllib.parse import parse_qs
+
+import falcon
+import falcon.uri
+import jinja2
+import msgpack
 import ujson
-from falcon import (HTTP_200, HTTP_201, HTTP_204, HTTP_503, HTTPBadRequest,
-                    HTTPNotFound, HTTPUnauthorized, HTTPForbidden, HTTPFound,
-                    HTTPInternalServerError, API)
+from falcon import (API, HTTP_200, HTTP_201, HTTP_204, HTTP_503,
+                    HTTPBadRequest, HTTPForbidden, HTTPFound,
+                    HTTPInternalServerError, HTTPNotFound, HTTPUnauthorized)
 from falcon_cors import CORS
+from gevent import Timeout, sleep, socket, spawn
+from jinja2.sandbox import SandboxedEnvironment
+from kazoo.client import KazooClient
 from sqlalchemy.exc import IntegrityError, InternalError, OperationalError
 
-from collections import defaultdict
-from streql import equals
+from iris.bin.sender import render, set_target_contact
+from iris.custom_import import import_custom_module
+from iris.custom_incident_handler import CustomIncidentHandlerDispatcher
+from iris.role_lookup import IrisRoleLookupException
+from iris.sender import auditlog
+from iris.sender.quota import (get_application_quotas_query,
+                               insert_application_quota_query, quota_int_keys,
+                               required_quota_keys)
+from iris.utils import sanitize_unicode_dict
+from iris.vendors.iris_slack import iris_slack
 
 from . import app_stats, cache, client, db, ui, utils
 from .config import load_config
-from iris.vendors.iris_slack import iris_slack
-from iris.sender import auditlog
-from iris.bin import sender
-from iris.sender.quota import (get_application_quotas_query, insert_application_quota_query,
-                               required_quota_keys, quota_int_keys)
-
-from iris.custom_import import import_custom_module
-from iris.custom_incident_handler import CustomIncidentHandlerDispatcher
-
-from .constants import (
-    XFRAME, XCONTENTTYPEOPTIONS, XXSSPROTECTION, PRIORITY_PRECEDENCE_MAP
-)
-
-from .plugins import init_plugins, find_plugin
-from .validators import init_validators, run_validation, IrisValidationException
+from .constants import (PRIORITY_PRECEDENCE_MAP, XCONTENTTYPEOPTIONS, XFRAME,
+                        XXSSPROTECTION)
+from .plugins import find_plugin, init_plugins
+from .role_lookup import get_role_lookups
+from .validators import (IrisValidationException, init_validators,
+                         run_validation)
 
 logger = logging.getLogger(__name__)
 
@@ -1562,6 +1574,35 @@ class Incidents(object):
                 WHERE `target`.`name` IN %s
             )''')
             sql_values.append(tuple(target))
+        if self.external_sender_incident_processing and target:
+            message_query_string = 'messages?limit=1000&incident_id__gt=0'
+            if req.params.get('created__ge'):
+                message_query_string += '&sent__ge=' + str(req.params.get('created__ge'))
+            if req.params.get('created__le'):
+                message_query_string += '&sent__le=' + str(req.params.get('created__le'))
+            for t in target:
+                message_query_string = message_query_string + '&target=' + str(t)
+            # get messages for incident
+            try:
+                external_sender_client = client.IrisClient(self.external_sender_address, self.external_sender_version, self.external_sender_app, self.external_sender_key)
+                r = external_sender_client.get(message_query_string, verify=self.verify)
+                if r.ok:
+                    incident_IDs = []
+                    messages = r.json()
+                    if len(messages) > 0:
+                        for message in messages:
+                            incident_IDs.append(message.get('incident_id'))
+                        where.append('''`incident`.`id` IN %s''')
+                        sql_values.append(tuple(incident_IDs))
+                    elif target:
+                        # if target field is specified and there are no matching messages that means there are no incidents that match the query
+                        resp.status = HTTP_200
+                        resp.body = ujson.dumps([])
+                        return
+                else:
+                    logger.error('failed retrieving messages from external sender %s', r.text)
+            except Exception as e:
+                logger.exception('failed to establish connection with iris message processor')
         if not (where or query_limit):
             raise HTTPBadRequest('Incident query too broad, add filter or limit')
         if where:
@@ -4882,6 +4923,21 @@ class TwilioDeliveryUpdate(object):
             raise HTTPBadRequest('Invalid keys in payload')
 
         affected = False
+        # if external sender is enabled send an api to update it there instead
+        if self.external_sender_incident_processing:
+            payload = {
+                'status': status,
+                'vendor_identifier': sid
+            }
+            external_sender_client = client.IrisClient(self.external_sender_address, self.external_sender_version, self.external_sender_app, self.external_sender_key)
+            r = external_sender_client.post('message_status', json=payload, verify=self.verify)
+            if r.ok:
+                resp.status = HTTP_204
+                return
+            logger.error("failed updating message status via external sender: %s", r.text)
+            resp.status = str(r.status_code)
+            return
+
         connection = db.engine.raw_connection()
         cursor = connection.cursor()
         try:
@@ -5893,9 +5949,10 @@ class InternalBuildMessages():
                 continue
             try:
                 message = render(message)
-                messages.append(message)
             except Exception as e:
                 logger.warning('Failed to render message %s with error: %s' % (ujson.dumps(notification), str(e)))
+            # send unrendered message even if we fail to render
+            messages.append(message)
         if len(messages) == 0:
             raise HTTPBadRequest('Failed to build, could not resolve any messages from notification')
 
@@ -5945,8 +6002,19 @@ class InternalBuildMessages():
             # replace the multi-message formatted list with the individual formatted messages list
             messages = split_msgs
 
+        # deduplicate messages with same destination
+        unique_messages = []
+        unique_destinations = defaultdict(set)
+        for message in messages:
+            if message.get("destination") and message.get("mode") not in unique_destinations[message["destination"]]:
+                unique_destinations[message["destination"]].add(message["mode"])
+                unique_messages.append(message)
+            if message.get("bcc_destination") and message.get("mode") not in unique_destinations[message["bcc_destination"]]:
+                unique_destinations[message["bcc_destination"]].add(message["mode"])
+                unique_messages.append(message)
+
         resp.status = HTTP_200
-        resp.body = ujson.dumps(messages)
+        resp.body = ujson.dumps(unique_messages)
 
 
 class InternalApplicationsAuth():
